@@ -2058,7 +2058,7 @@ async def collect_and_persist_metrics(guild=None):
                         elif voice_connected and (player_playing or player_paused or g.id in playback_tracking):
                             await cur.execute(
                                 "UPDATE alucard_playback_state SET channel_id = COALESCE(%s, channel_id), is_playing = %s, is_paused = %s, position_seconds = %s WHERE guild_id = %s AND bot_name = 'alucard'",
-                                (channel_id, player_playing, player_paused, int(live_position or playback_row.get("position_seconds") or 0), g.id),
+                                (channel_id, player_playing, player_paused, int(live_position or metrics_row.get("position_seconds") or 0), g.id),
                             )
                         await cur.execute(
                             """
@@ -2079,7 +2079,7 @@ async def collect_and_persist_metrics(guild=None):
                                 int(metrics_row.get("backup_total") or 0),
                                 bool(metrics_row.get("is_playing")) if voice_connected else False,
                                 bool(metrics_row.get("is_paused")) if voice_connected else False,
-                                int(live_position or playback_row.get("position_seconds") or 0),
+                                int(live_position or metrics_row.get("position_seconds") or 0),
                                 g.id in recovering_guilds or str(g.id) in guild_states,
                                 bool(lavalink_ready),
                                 metrics_last_errors.get(g.id),
