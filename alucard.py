@@ -223,6 +223,11 @@ root_logger.addHandler(file_handler)
 for _logger_name in ("discord", "wavelink", "aiohttp", "asyncio"):
     _lib_logger = logging.getLogger(_logger_name)
     _lib_logger.setLevel(logging.INFO)
+    # discord.py may install its own StreamHandler. Remove library-local console/file
+    # handlers and let the root logger own output, otherwise every line prints twice.
+    for _handler in list(_lib_logger.handlers):
+        if isinstance(_handler, (logging.StreamHandler, RotatingFileHandler)):
+            _lib_logger.removeHandler(_handler)
     _lib_logger.propagate = True
 
 logger = logging.getLogger("discord")
@@ -554,9 +559,9 @@ def install_error_reporting():
     global error_reporting_installed
     if error_reporting_installed:
         return
-    handler = SwarmErrorWebhookHandler(level=logging.ERROR)
-    logger.addHandler(handler)
-    logging.getLogger().addHandler(handler)
+    root_logger = logging.getLogger()
+    if not any(isinstance(_handler, SwarmErrorWebhookHandler) for _handler in root_logger.handlers):
+        root_logger.addHandler(SwarmErrorWebhookHandler(level=logging.ERROR))
     sys.excepthook = lambda exc_type, exc, tb: dispatch_runtime_error(
         'Uncaught Python Exception',
         exc,
@@ -615,6 +620,8 @@ recovery_exhausted_until = {}
 voice_disconnect_grace_tasks = {}
 idle_voice_since = {}
 auto_restore_snooze_until = {}
+resilience_queue_retry_after = {}
+voice_connect_inflight_until = {}
 startup_task_registry = {}
 MAX_RUNTIME_GUILD_CACHE_ENTRIES = max(64, int(os.getenv(f"{BOT_ENV_PREFIX}_RUNTIME_GUILD_CACHE_MAX", os.getenv("RUNTIME_GUILD_CACHE_MAX", "512"))))
 
@@ -731,7 +738,7 @@ def prune_runtime_state_cache():
                 break
             mapping.pop(removable, None)
 
-    for mapping in (last_position_persist, recovery_retry_counts, track_failure_counts, recovery_exhausted_until, idle_voice_since, auto_restore_snooze_until, vote_skip_sessions, metrics_last_errors, STATE_FILE_WRITE_CACHE, pending_voice_channels):
+    for mapping in (last_position_persist, recovery_retry_counts, track_failure_counts, recovery_exhausted_until, idle_voice_since, auto_restore_snooze_until, resilience_queue_retry_after, voice_connect_inflight_until, vote_skip_sessions, metrics_last_errors, STATE_FILE_WRITE_CACHE, pending_voice_channels):
         prune_mapping(mapping)
 
 
@@ -827,7 +834,25 @@ metrics_last_errors = {}
 METRICS_HEARTBEAT_INTERVAL = max(5, int(os.getenv(f"{BOT_ENV_PREFIX}_METRICS_HEARTBEAT_INTERVAL", os.getenv("METRICS_HEARTBEAT_INTERVAL", "15"))))
 VOICE_REJOIN_DELAY_SECONDS = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_REJOIN_DELAY_SECONDS", os.getenv("VOICE_REJOIN_DELAY_SECONDS", "5"))))
 VOICE_CONNECT_TIMEOUT_SECONDS = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_SECONDS", "90"))))
-VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS = max(15.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", "45"))))
+VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS = max(
+    VOICE_CONNECT_TIMEOUT_SECONDS * 2.0,
+    float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", os.getenv("VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS", "300"))),
+)
+VOICE_CONNECT_QUEUE_RETRY_ENABLED = os.getenv(
+    f"{BOT_ENV_PREFIX}_VOICE_CONNECT_QUEUE_RETRY_ENABLED",
+    os.getenv("VOICE_CONNECT_QUEUE_RETRY_ENABLED", "true"),
+).strip().lower() not in {"0", "false", "off", "no"}
+VOICE_CONNECT_QUEUE_RETRY_BACKOFF_SECONDS = max(
+    15.0,
+    float(os.getenv(
+        f"{BOT_ENV_PREFIX}_VOICE_CONNECT_QUEUE_RETRY_BACKOFF_SECONDS",
+        os.getenv("VOICE_CONNECT_QUEUE_RETRY_BACKOFF_SECONDS", "45"),
+    )),
+)
+RESILIENCE_STUCK_QUEUE_RETRY_SECONDS = max(
+    30.0,
+    float(os.getenv(f"{BOT_ENV_PREFIX}_RESILIENCE_STUCK_QUEUE_RETRY_SECONDS", os.getenv("RESILIENCE_STUCK_QUEUE_RETRY_SECONDS", "150"))),
+)
 LAVALINK_HEALTH_STARTUP_GRACE_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_LAVALINK_HEALTH_STARTUP_GRACE_SECONDS", os.getenv("LAVALINK_HEALTH_STARTUP_GRACE_SECONDS", "25"))))
 STARTUP_RECOVERY_JITTER_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_STARTUP_RECOVERY_JITTER_SECONDS", os.getenv("STARTUP_RECOVERY_JITTER_SECONDS", "12"))))
 VOICE_REJOIN_JITTER_MIN_SECONDS = max(0.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_REJOIN_JITTER_MIN_SECONDS", os.getenv("VOICE_REJOIN_JITTER_MIN_SECONDS", "2"))))
@@ -1885,6 +1910,16 @@ def recovery_backoff_remaining(guild_id):
         return 0
     return int(max(1, remaining))
 
+def voice_connect_inflight_remaining(guild_id):
+    remaining = voice_connect_inflight_until.get(guild_id, 0) - time.time()
+    if remaining <= 0:
+        voice_connect_inflight_until.pop(guild_id, None)
+        return 0
+    return int(max(1, remaining))
+
+def clear_voice_connect_inflight(guild_id):
+    voice_connect_inflight_until.pop(guild_id, None)
+
 def clear_recovery_backoff(guild_id):
     recovery_exhausted_until.pop(guild_id, None)
 
@@ -2439,11 +2474,16 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
         "zombie_restore",
         "lavalink_health",
     ))
-    if voice_rejoin_reason and not VOICE_DISCONNECT_REJOIN_RECOVERY:
+    queue_voice_retry = VOICE_CONNECT_QUEUE_RETRY_ENABLED and any(token in reason_text for token in (
+        "voice_connect",
+        "voice_connect_timeout",
+    ))
+    if voice_rejoin_reason and not VOICE_DISCONNECT_REJOIN_RECOVERY and not queue_voice_retry:
         logger.info(f"[{guild_id}] Skipping {reason} recovery retry because bot-side voice rejoin recovery is disabled; Aria-managed recovery remains available.")
         return False
 
-    if recovery_backoff_remaining(guild_id) > 0:
+    backoff_delay = recovery_backoff_remaining(guild_id)
+    if backoff_delay > 0 and not queue_voice_retry:
         return False
 
     existing = recovery_retry_tasks.get(guild_id)
@@ -2458,7 +2498,7 @@ def schedule_recovery_retry(guild_id, channel_id, *, start_position=0, reason="r
         return False
 
     recovery_retry_counts[guild_id] = attempts
-    delay = min(RECOVERY_RETRY_BASE_DELAY * attempts, RECOVERY_RETRY_MAX_DELAY) + random.uniform(0.0, RECOVERY_RETRY_JITTER_SECONDS)
+    delay = backoff_delay + min(RECOVERY_RETRY_BASE_DELAY * attempts, RECOVERY_RETRY_MAX_DELAY) + random.uniform(0.0, RECOVERY_RETRY_JITTER_SECONDS)
     current_task = None
 
     async def _retry():
@@ -2862,9 +2902,13 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
                 voice_client = None
 
             if not voice_client:
+                voice_connect_inflight_until[guild.id] = time.time() + VOICE_CONNECT_TIMEOUT_SECONDS + 15.0
                 voice_client = await channel.connect(cls=wavelink.Player, timeout=VOICE_CONNECT_TIMEOUT_SECONDS)
+                clear_voice_connect_inflight(guild.id)
             elif voice_client.channel.id != channel_id:
+                voice_connect_inflight_until[guild.id] = time.time() + VOICE_CONNECT_TIMEOUT_SECONDS + 15.0
                 await voice_client.move_to(channel)
+                clear_voice_connect_inflight(guild.id)
             await ensure_self_deaf(guild, voice_client)
             if getattr(voice_client, "channel", None):
                 pending_voice_channels[guild.id] = voice_client.channel.id
@@ -2879,10 +2923,12 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
 
             return voice_client
         except Exception as e:
+            clear_voice_connect_inflight(guild.id)
             logger.error(f"[{guild.id}] Voice connect error: {e}")
             message = str(e).lower()
             if isinstance(e, asyncio.TimeoutError) or "exceeded the timeout" in message or "timed out" in message:
-                arm_recovery_backoff(guild.id, seconds=VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS, reason="voice_connect_timeout")
+                timeout_backoff = VOICE_CONNECT_QUEUE_RETRY_BACKOFF_SECONDS if VOICE_CONNECT_QUEUE_RETRY_ENABLED else max(VOICE_CONNECT_TIMEOUT_BACKOFF_SECONDS, VOICE_CONNECT_TIMEOUT_SECONDS * 2.0)
+                arm_recovery_backoff(guild.id, seconds=timeout_backoff, reason="voice_connect_timeout")
                 try:
                     await mark_voice_disconnected(guild.id, channel_id, desired_connected=True, reason="voice_connect_timeout")
                 except Exception:
@@ -2954,6 +3000,13 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
                                 logger.debug("[%s] Track intelligence outcome write skipped.", payload.player.guild.id, exc_info=True)
 
                             if reason == "FINISHED":
+                                # Clear the poison-track retry counter only after a real clean finish.
+                                # This prevents a broken YouTube stream from being retried forever as attempt 1/3.
+                                clear_track_failure(
+                                    payload.player.guild.id,
+                                    getattr(payload.track, 'uri', None) or track_data.get('url'),
+                                    getattr(payload.track, 'title', None) or track_data.get('title'),
+                                )
                                 if loop_mode == 'queue':
                                     await requeue_finished_track(cur, payload.player.guild.id, payload.track.uri, payload.track.title, original_requester)
                                 elif loop_mode == 'song':
@@ -3097,7 +3150,8 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
 
                 try:
                     await asyncio.wait_for(voice_client.play(track), timeout=LAVALINK_PLAY_TIMEOUT_SECONDS)
-                    clear_track_failure(guild.id, url, title)
+                    # Do not clear Lavalink failure counters here. play() only means Lavalink accepted the track;
+                    # the stream can still fail seconds later. Clear only after a clean FINISHED event.
                     if start_position > 0:
                         await voice_client.seek(int(start_position * 1000))
                     elif trans_mode in {'fade', 'smart'}:
@@ -3138,7 +3192,13 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                 await send_or_update_status_message(guild, embed)
 
 async def process_queue(guild, channel_id, start_position=0, *, allow_recovery_restore=False):
-    if allow_recovery_restore and recovery_backoff_remaining(guild.id) > 0:
+    backoff_remaining = recovery_backoff_remaining(guild.id)
+    if backoff_remaining > 0:
+        logger.info(f"[{guild.id}] Process queue deferred for {backoff_remaining}s because voice/recovery backoff is active.")
+        return
+    inflight_remaining = voice_connect_inflight_remaining(guild.id)
+    if inflight_remaining > 0:
+        logger.info(f"[{guild.id}] Process queue deferred for {inflight_remaining}s because a voice connection attempt is already in flight.")
         return
     lock = get_process_queue_lock(guild.id)
     async with lock:
@@ -3541,12 +3601,20 @@ async def position_updater():
 @bot.tree.command(name="alucard_main_sethome", description="Save this bot's default voice or stage channel for join, autoplay, and recovery behavior.")
 @commands.has_permissions(administrator=True)
 async def sethome(interaction: discord.Interaction, channel: discord.VoiceChannel | discord.StageChannel):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.NotFound:
+        logger.warning("[%s] /sethome interaction expired before it could be acknowledged.", getattr(interaction.guild, "id", "unknown"))
+        return
+    except discord.InteractionResponded:
+        pass
+
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("REPLACE INTO alucard_bot_home_channels (guild_id, bot_name, home_vc_id) VALUES (%s, %s, %s)", (interaction.guild.id, 'alucard', channel.id))
     invalidate_feature_caches(interaction.guild.id)
-    await interaction.response.send_message(embed=discord.Embed(title="🏠 Home Set", description=f"Home channel set to {channel.mention}.", color=discord.Color.green()), ephemeral=True)
+    await interaction.followup.send(embed=discord.Embed(title="🏠 Home Set", description=f"Home channel set to {channel.mention}.", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="alucard_main_setfeedback", description="Choose the text channel for updates, queue actions, and recovery notices.")
 @commands.has_permissions(administrator=True)
@@ -5170,6 +5238,15 @@ async def resilience_loop():
                                 or (vc.channel.id if vc and getattr(vc, "channel", None) else None)
                             )
                             if stuck_channel_id and guild.id not in recovering_guilds and recovery_backoff_remaining(guild.id) <= 0:
+                                process_task = startup_task_registry.get(f"resilience_stuck_queue:{guild.id}") or startup_task_registry.get(f"process_queue:{guild.id}")
+                                if process_task and not process_task.done():
+                                    continue
+                                if voice_connect_inflight_remaining(guild.id) > 0:
+                                    continue
+                                next_allowed = resilience_queue_retry_after.get(guild.id, 0)
+                                if now < next_allowed:
+                                    continue
+                                resilience_queue_retry_after[guild.id] = now + RESILIENCE_STUCK_QUEUE_RETRY_SECONDS
                                 logger.warning(
                                     "[%s] Resilience loop: %s queued track(s) found with no active player; re-triggering process_queue.",
                                     guild.id, queue_count,
