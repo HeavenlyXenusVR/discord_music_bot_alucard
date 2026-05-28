@@ -403,6 +403,21 @@ def _wavelink_event_reason(reason) -> str:
     if "." in text:
         text = text.rsplit(".", 1)[-1]
     return text
+
+
+def _mysql_error_code(exc):
+    args = getattr(exc, "args", ()) or ()
+    if args:
+        try:
+            return int(args[0])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _is_retryable_mysql_error(exc):
+    return _mysql_error_code(exc) in {1205, 1213, 2006, 2013}
+
 # --- OPTIMIZATION MAP: startup, DB bootstrap, runtime recovery, slash commands, and swarm bridge are intentionally separated below. ---
 # --- CONFIGURATION ---
 BOT_ENV_PREFIX = "ALUCARD"
@@ -912,6 +927,10 @@ def _runtime_key(value):
         return value
 
 
+def _status_message_cache_key(guild_id):
+    return (_runtime_key(guild_id), BOT_ENV_PREFIX.lower())
+
+
 def aria_recovery_authority_blocks_self_heal(action="self_heal", guild_id=None):
     """Return True when Aria owns recovery and this bot should only preserve/report state."""
     blocked = bool(ARIA_RECOVERY_AUTHORITY and not BOT_SELF_HEAL_WHEN_ARIA_AUTHORITY)
@@ -934,6 +953,8 @@ def _queue_parity_signature(rows):
     for row in rows or []:
         try:
             digest.update(str(_track_key(_row_value(row, "video_url", _row_value(row, 1, "")), _row_value(row, "title", _row_value(row, 2, "")))).encode("utf-8", "ignore"))
+            digest.update(b"\0")
+            digest.update(str(_row_track_uid(row, 4, default="")).encode("utf-8", "ignore"))
             digest.update(b"\0")
         except Exception:
             digest.update(repr(row).encode("utf-8", "ignore"))
@@ -1405,6 +1426,8 @@ DIRECT_ORDER_RETRY_DELAY_SECONDS = max(5, int(os.getenv(f"{BOT_ENV_PREFIX}_DIREC
 DIRECT_ORDER_RETRY_BACKDATE_SECONDS = max(0, DIRECT_ORDER_CLAIM_TIMEOUT_SECONDS - DIRECT_ORDER_RETRY_DELAY_SECONDS)
 DIRECT_ORDER_STALE_SECONDS = max(300, int(os.getenv(f"{BOT_ENV_PREFIX}_DIRECT_ORDER_STALE_SECONDS", os.getenv("DIRECT_ORDER_STALE_SECONDS", "900"))))
 DIRECT_ORDER_CLAIM_TOKEN = f"{BOT_ENV_PREFIX.lower()}:{os.getpid()}:{time.time_ns()}:{random.randint(100000, 999999)}"
+DIRECT_ORDER_DB_RETRY_ATTEMPTS = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_DIRECT_ORDER_DB_RETRY_ATTEMPTS", os.getenv("DIRECT_ORDER_DB_RETRY_ATTEMPTS", "4"))))
+DIRECT_ORDER_DB_RETRY_BASE_DELAY_SECONDS = max(0.05, float(os.getenv(f"{BOT_ENV_PREFIX}_DIRECT_ORDER_DB_RETRY_BASE_DELAY_SECONDS", os.getenv("DIRECT_ORDER_DB_RETRY_BASE_DELAY_SECONDS", "0.25"))))
 SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS = max(
     30.0,
     float(os.getenv(f"{BOT_ENV_PREFIX}_SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS", os.getenv("SWARM_BRIDGE_DB_ERROR_LOG_INTERVAL_SECONDS", "120"))),
@@ -3880,6 +3903,9 @@ async def repair_queue_backup_parity(cur, guild_id, *, reason="queue_integrity",
         logger.warning("[%s] Queue parity repair capped missing live rows from %s to %s after %s.", guild_id, len(missing_live_rows), QUEUE_PARITY_REPAIR_MAX_ROWS, reason)
         missing_live_rows = missing_live_rows[:QUEUE_PARITY_REPAIR_MAX_ROWS]
 
+    if missing_live_rows and not queue_parity_repair_allowed(guild_id, backup_rows, live_rows, reason=reason):
+        return 0, 0
+
     # Find live rows that do not have a matching backup row.  When live and
     # backup counts are equal but contain different tracks, the previous repair
     # code missed the issue.  We now delete one stale live row before copying the
@@ -3956,6 +3982,9 @@ async def repair_queue_backup_parity(cur, guild_id, *, reason="queue_integrity",
     if len(missing_backup_rows) > QUEUE_PARITY_REPAIR_MAX_ROWS:
         logger.warning("[%s] Queue parity repair capped missing backup rows from %s to %s after %s.", guild_id, len(missing_backup_rows), QUEUE_PARITY_REPAIR_MAX_ROWS, reason)
         missing_backup_rows = missing_backup_rows[:QUEUE_PARITY_REPAIR_MAX_ROWS]
+
+    if missing_backup_rows and restored_live == 0 and not queue_parity_repair_allowed(guild_id, backup_rows, live_rows, reason=reason):
+        return restored_live, 0
 
     restored_backup = 0
     for row in missing_backup_rows:
@@ -4704,9 +4733,10 @@ async def clear_voice_channel_status(guild):
 
 
 async def send_or_update_status_message(guild, embed):
-    """Maintain one live now-playing/status message per guild without duplicate edits."""
+    """Maintain one live status message per guild for this bot without duplicate edits."""
     fingerprint = _embed_fingerprint(embed)
-    cached = STATUS_MESSAGE_CACHE.get(guild.id)
+    status_cache_key = _status_message_cache_key(guild.id)
+    cached = STATUS_MESSAGE_CACHE.get(status_cache_key)
     if cached and cached.get("fingerprint") == fingerprint and time.time() - cached.get("updated_at", 0) < STATUS_MESSAGE_DEDUP_SECONDS:
         return
     async with DBPoolManager() as pool:
@@ -4741,7 +4771,7 @@ async def send_or_update_status_message(guild, embed):
                         new_message_id = message.id
                     except (aiohttp.ClientConnectionResetError, ConnectionResetError):
                         return
-                STATUS_MESSAGE_CACHE[guild.id] = {"fingerprint": fingerprint, "updated_at": time.time(), "message_id": new_message_id, "channel_id": channel.id}
+                STATUS_MESSAGE_CACHE[status_cache_key] = {"fingerprint": fingerprint, "updated_at": time.time(), "message_id": new_message_id, "channel_id": channel.id}
                 await cur.execute("REPLACE INTO alucard_status_messages (guild_id, bot_name, feedback_channel_id, message_id) VALUES (%s, 'alucard', %s, %s)", (guild.id, channel.id, new_message_id))
 
 async def send_feedback(guild, embed):
@@ -5510,13 +5540,19 @@ async def auto_heal_loop():
             if guild:
                 vc = guild.voice_client
                 if (not vc or not vc.is_connected()) or (vc and not _player_is_active(vc) and state.get("voice_channel_id")):
-                    logger.info(f"[HEAL] Rejoining/restarting playback for {gid}")
                     if vc and not _player_is_active(vc):
                         playback_tracking.pop(normalized_gid, None)
+                    scheduled = False
                     if state.get("position", 0) > 0 and state.get("track_uid") and TARGETED_TRACK_INTERRUPT_RECOVERY:
-                        schedule_targeted_interrupt_resume(normalized_gid, state.get("voice_channel_id"), start_position=state.get("position", 0), reason="auto_heal")
+                        scheduled = schedule_targeted_interrupt_resume(normalized_gid, state.get("voice_channel_id"), start_position=state.get("position", 0), reason="auto_heal")
                     elif VOICE_DISCONNECT_REJOIN_RECOVERY:
-                        schedule_named_task(f"restore_guild_state:{gid}", restore_guild_state(normalized_gid, state))
+                        task_name = f"restore_guild_state:{gid}"
+                        existing_task = startup_task_registry.get(task_name)
+                        if not existing_task or existing_task.done():
+                            schedule_named_task(task_name, restore_guild_state(normalized_gid, state))
+                            scheduled = True
+                    if scheduled:
+                        logger.info(f"[HEAL] Rejoining/restarting playback for {gid}")
         except Exception:
             pass
 
@@ -7321,12 +7357,13 @@ async def playlist_sync_loop():
                             target_channel = vc.channel if vc and getattr(vc, 'channel', None) else guild.get_channel(channel_id) if channel_id else await get_home_channel(guild)
                             if target_channel:
                                 schedule_named_task(f"playlist_sync_process_queue:{guild.id}", process_queue(guild, target_channel.id))
-                        embed = discord.Embed(
-                            title="📡 Playlist Synced",
-                            description=f"Added **{added_count}** new playlist track(s), removed **{purged_live}** stale live queue row(s), and cleaned **{purged_backup}** backup row(s).",
-                            color=discord.Color.green(),
+                        await send_feedback_notice(
+                            guild,
+                            "📡 Playlist Synced",
+                            f"Added **{added_count}** new playlist track(s), removed **{purged_live}** stale live queue row(s), and cleaned **{purged_backup}** backup row(s).",
+                            discord.Color.green(),
+                            dedupe_key=f"playlist_sync:{added_count}:{purged_live}:{purged_backup}",
                         )
-                        await send_or_update_status_message(guild, embed)
                         await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "📡 Playlist Sync", f"Guild {guild.name}: +{added_count} playlist track(s), -{purged_live} live row(s), -{purged_backup} backup row(s).", discord.Color.green())
             except Exception as e:
                 logger.error("[%s] Playlist sync loop failed for guild %s: %s", BOT_ENV_PREFIX.lower(), guild_id, e, exc_info=True)
@@ -7736,57 +7773,50 @@ async def direct_order_listener():
     try:
         if not await ensure_swarm_command_tables():
             return
-        async with DBPoolManager() as pool:
-            async with pool.acquire() as conn:
-                async with conn.cursor(aiomysql.DictCursor) as cur:
-                    # Clear stale/unclaimed direct orders before fetching. Aria will re-issue if still needed.
-                    try:
-                        await cur.execute("START TRANSACTION")
-                        await cur.execute("DELETE FROM alucard_swarm_direct_orders WHERE bot_name = %s AND created_at < NOW() - INTERVAL %s SECOND", ('alucard', DIRECT_ORDER_STALE_SECONDS))
-                        await cur.execute(
-                            """
-                            SELECT id
-                            FROM alucard_swarm_direct_orders
-                            WHERE bot_name = %s
-                              AND COALESCE(attempts, 0) < %s
-                              AND (claimed_at IS NULL OR claimed_at <= NOW() - INTERVAL %s SECOND)
-                            ORDER BY id ASC
-                            LIMIT %s
-                            FOR UPDATE
-                            """,
-                            ('alucard', DIRECT_ORDER_MAX_ATTEMPTS, DIRECT_ORDER_CLAIM_TIMEOUT_SECONDS, DIRECT_ORDER_FETCH_LIMIT),
-                        )
-                        candidates = await cur.fetchall()
-                        ids = [int(o['id']) for o in candidates if o.get('id') is not None]
-                        if ids:
-                            placeholders = ','.join(['%s'] * len(ids))
-                            await cur.execute(
-                                f"""UPDATE alucard_swarm_direct_orders
-                                    SET claimed_at = NOW(), claim_token = %s
-                                    WHERE id IN ({placeholders})
-                                      AND bot_name = %s
-                                      AND COALESCE(attempts, 0) < %s
-                                      AND (claimed_at IS NULL OR claimed_at <= NOW() - INTERVAL %s SECOND)""",
-                                (DIRECT_ORDER_CLAIM_TOKEN, *ids, 'alucard', DIRECT_ORDER_MAX_ATTEMPTS, DIRECT_ORDER_CLAIM_TIMEOUT_SECONDS),
-                            )
+        for claim_attempt in range(DIRECT_ORDER_DB_RETRY_ATTEMPTS):
+            try:
+                async with DBPoolManager() as pool:
+                    async with pool.acquire() as conn:
+                        async with conn.cursor(aiomysql.DictCursor) as cur:
+                            # Claim with one ordered UPDATE instead of SELECT ... FOR UPDATE to reduce deadlocks with Aria inserts.
+                            await cur.execute("DELETE FROM alucard_swarm_direct_orders WHERE bot_name = %s AND created_at < NOW() - INTERVAL %s SECOND", ('alucard', DIRECT_ORDER_STALE_SECONDS))
                             await cur.execute(
                                 """
-                                SELECT id, bot_name, guild_id, vc_id, text_channel_id, command, data, COALESCE(attempts, 0) AS attempts
-                                FROM alucard_swarm_direct_orders
-                                WHERE claim_token = %s
+                                UPDATE alucard_swarm_direct_orders
+                                SET claimed_at = NOW(), claim_token = %s
+                                WHERE bot_name = %s
+                                  AND COALESCE(attempts, 0) < %s
+                                  AND (claimed_at IS NULL OR claimed_at <= NOW() - INTERVAL %s SECOND)
                                 ORDER BY id ASC
                                 LIMIT %s
                                 """,
-                                (DIRECT_ORDER_CLAIM_TOKEN, DIRECT_ORDER_FETCH_LIMIT),
+                                (DIRECT_ORDER_CLAIM_TOKEN, 'alucard', DIRECT_ORDER_MAX_ATTEMPTS, DIRECT_ORDER_CLAIM_TIMEOUT_SECONDS, DIRECT_ORDER_FETCH_LIMIT),
                             )
-                            orders = await cur.fetchall()
-                        await cur.execute("COMMIT")
-                    except Exception:
-                        try:
-                            await cur.execute("ROLLBACK")
-                        except Exception:
-                            pass
-                        raise
+                            if int(getattr(cur, "rowcount", 0) or 0) > 0:
+                                await cur.execute(
+                                    """
+                                    SELECT id, bot_name, guild_id, vc_id, text_channel_id, command, data, COALESCE(attempts, 0) AS attempts
+                                    FROM alucard_swarm_direct_orders
+                                    WHERE claim_token = %s
+                                    ORDER BY id ASC
+                                    LIMIT %s
+                                    """,
+                                    (DIRECT_ORDER_CLAIM_TOKEN, DIRECT_ORDER_FETCH_LIMIT),
+                                )
+                                orders = await cur.fetchall()
+                break
+            except Exception as exc:
+                if _is_retryable_mysql_error(exc) and claim_attempt + 1 < DIRECT_ORDER_DB_RETRY_ATTEMPTS:
+                    logger.warning(
+                        "[%s] Direct order claim hit retryable DB error %s; retrying (%s/%s).",
+                        BOT_ENV_PREFIX.lower(),
+                        _mysql_error_code(exc) or type(exc).__name__,
+                        claim_attempt + 1,
+                        DIRECT_ORDER_DB_RETRY_ATTEMPTS,
+                    )
+                    await asyncio.sleep(DIRECT_ORDER_DB_RETRY_BASE_DELAY_SECONDS * (claim_attempt + 1) + random.uniform(0.0, 0.25))
+                    continue
+                raise
 
         if not orders: return
 
@@ -7915,22 +7945,38 @@ async def direct_order_listener():
             else:
                 logger.warning("[alucard] Received direct order %s for unknown guild %s.", cmd, order['guild_id'])
 
-            async with DBPoolManager() as pool:
-                async with pool.acquire() as conn:
-                    async with conn.cursor() as cur:
-                        try:
-                            await cur.execute("START TRANSACTION")
-                            if executed or attempts + 1 >= DIRECT_ORDER_MAX_ATTEMPTS or not guild:
-                                await cur.execute("DELETE FROM alucard_swarm_direct_orders WHERE id = %s", (oid,))
-                            else:
-                                await cur.execute("UPDATE alucard_swarm_direct_orders SET attempts = COALESCE(attempts, 0) + 1, last_error = %s, claimed_at = DATE_SUB(NOW(), INTERVAL %s SECOND), claim_token = NULL WHERE id = %s", (f"unexecuted:{cmd}", DIRECT_ORDER_RETRY_BACKDATE_SECONDS, oid))
-                            await cur.execute("COMMIT")
-                        except Exception:
-                            try:
-                                await cur.execute("ROLLBACK")
-                            except Exception:
-                                pass
-                            raise
+            for finalize_attempt in range(DIRECT_ORDER_DB_RETRY_ATTEMPTS):
+                try:
+                    async with DBPoolManager() as pool:
+                        async with pool.acquire() as conn:
+                            async with conn.cursor() as cur:
+                                try:
+                                    await cur.execute("START TRANSACTION")
+                                    if executed or attempts + 1 >= DIRECT_ORDER_MAX_ATTEMPTS or not guild:
+                                        await cur.execute("DELETE FROM alucard_swarm_direct_orders WHERE id = %s", (oid,))
+                                    else:
+                                        await cur.execute("UPDATE alucard_swarm_direct_orders SET attempts = COALESCE(attempts, 0) + 1, last_error = %s, claimed_at = DATE_SUB(NOW(), INTERVAL %s SECOND), claim_token = NULL WHERE id = %s", (f"unexecuted:{cmd}", DIRECT_ORDER_RETRY_BACKDATE_SECONDS, oid))
+                                    await cur.execute("COMMIT")
+                                except Exception:
+                                    try:
+                                        await cur.execute("ROLLBACK")
+                                    except Exception:
+                                        pass
+                                    raise
+                    break
+                except Exception as exc:
+                    if _is_retryable_mysql_error(exc) and finalize_attempt + 1 < DIRECT_ORDER_DB_RETRY_ATTEMPTS:
+                        logger.warning(
+                            "[%s] Direct order finalize hit retryable DB error %s for order %s; retrying (%s/%s).",
+                            BOT_ENV_PREFIX.lower(),
+                            _mysql_error_code(exc) or type(exc).__name__,
+                            oid,
+                            finalize_attempt + 1,
+                            DIRECT_ORDER_DB_RETRY_ATTEMPTS,
+                        )
+                        await asyncio.sleep(DIRECT_ORDER_DB_RETRY_BASE_DELAY_SECONDS * (finalize_attempt + 1) + random.uniform(0.0, 0.25))
+                        continue
+                    raise
 
     except Exception:
         logger.exception("Direct order listener failed for alucard.")
