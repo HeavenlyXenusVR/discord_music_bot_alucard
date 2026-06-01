@@ -428,7 +428,7 @@ DB_CONFIG = {
     'pool_recycle': int(os.getenv(f"{BOT_ENV_PREFIX}_DB_POOL_RECYCLE_SECONDS", os.getenv("DB_POOL_RECYCLE_SECONDS", "280"))),
     'connect_timeout': int(os.getenv(f"{BOT_ENV_PREFIX}_DB_CONNECT_TIMEOUT_SECONDS", os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "10"))),
 }
-DB_POOL_MINSIZE = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_DB_POOL_MINSIZE", os.getenv("DB_POOL_MINSIZE", "1"))))
+DB_POOL_MINSIZE = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_DB_POOL_MINSIZE", os.getenv("DB_POOL_MINSIZE", "3"))))
 DB_POOL_MAXSIZE = max(DB_POOL_MINSIZE, int(os.getenv(f"{BOT_ENV_PREFIX}_DB_POOL_MAXSIZE", os.getenv("DB_POOL_MAXSIZE", "32"))))
 DB_POOL_PING_INTERVAL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_DB_POOL_PING_INTERVAL_SECONDS", os.getenv("DB_POOL_PING_INTERVAL_SECONDS", "30"))))
 DEFAULT_LAVALINK_URI = os.getenv("LAVALINK_URI") or os.getenv("LAVALINK_URL") or os.getenv("LAVALINK_HOST") or "http://127.0.0.1:2333"
@@ -2036,7 +2036,11 @@ async def init_db():
                 await safe_schema_execute(cur, "CREATE INDEX alucard_playback_track_uid_idx ON alucard_playback_state (bot_name, track_uid)")
                 await safe_schema_execute(cur, "CREATE INDEX alucard_playlist_bot_idx ON alucard_active_playlists (bot_name, guild_id)")
                 await safe_schema_execute(cur, "CREATE INDEX alucard_playlist_track_uid_idx ON alucard_active_playlist_tracks (guild_id, bot_name, track_uid)")
+                await safe_schema_execute(cur, "CREATE INDEX alucard_active_playlist_tracks_guild_bot_idx ON alucard_active_playlist_tracks (guild_id, bot_name, position_idx)")
+                await safe_schema_execute(cur, "CREATE INDEX alucard_active_playlist_tracks_del_idx ON alucard_active_playlist_tracks (guild_id, bot_name, playlist_url(255))")
                 await safe_schema_execute(cur, "CREATE INDEX alucard_user_playlist_lookup_idx ON alucard_user_playlists (user_id, playlist_name)")
+                await safe_schema_execute(cur, "DROP INDEX alucard_queue_track_uid_idx ON alucard_queue")
+                await safe_schema_execute(cur, "DROP INDEX alucard_queue_backup_track_uid_idx ON alucard_queue_backup")
                 await safe_schema_execute(cur, "ALTER TABLE alucard_playback_state ADD COLUMN bot_name VARCHAR(50) DEFAULT 'alucard'")
                 await safe_schema_execute(cur, "ALTER TABLE alucard_active_playlists ADD COLUMN bot_name VARCHAR(50) DEFAULT 'alucard'")
                 await safe_schema_execute(cur, "ALTER TABLE alucard_bot_home_channels ADD COLUMN bot_name VARCHAR(50) DEFAULT 'alucard'")
@@ -2066,6 +2070,8 @@ async def init_db():
                 await dedupe_queue_table_by_track_key(cur, "alucard_queue_backup", bot_name="alucard")
                 await safe_schema_execute(cur, "CREATE UNIQUE INDEX alucard_queue_track_uid_unique_idx ON alucard_queue (guild_id, bot_name, track_uid)")
                 await safe_schema_execute(cur, "CREATE UNIQUE INDEX alucard_queue_backup_track_uid_unique_idx ON alucard_queue_backup (guild_id, bot_name, track_uid)")
+                await safe_schema_execute(cur, "CREATE INDEX alucard_active_playlists_lookup_idx ON alucard_active_playlists (guild_id, bot_name)")
+                await safe_schema_execute(cur, "CREATE INDEX alucard_error_events_guild_time_idx ON alucard_error_events (guild_id, created_at)")
                 playlist_db_initialized = True
                 logger.info("Database tables verified/created for ALUCARD.")
 
@@ -3265,37 +3271,62 @@ async def collect_and_persist_metrics(guild=None):
         lavalink_ready = await ensure_lavalink_ready(timeout=1.0)
     except Exception as tx_error:
         lavalink_ready = False
+
+    # Snapshot in-memory state (no DB, no await) for all guilds upfront.
+    guild_snapshots = []
+    for g in guilds:
+        if not g:
+            continue
+        vc = g.voice_client
+        channel_id = getattr(getattr(vc, "channel", None), "id", None)
+        voice_connected = bool(vc and _voice_client_connected(vc))
+        player_playing = bool(vc and _player_is_playing(vc))
+        player_paused = bool(vc and _player_is_paused(vc))
+        live_position = current_track_position(g.id) if (player_playing or player_paused or g.id in playback_tracking) else 0
+        live_duration = int(playback_tracking.get(g.id, {}).get('duration', 0)) if g.id in playback_tracking else 0
+        guild_snapshots.append((g, channel_id, voice_connected, player_playing, player_paused, live_position, live_duration))
+
+    async def _fetch_guild_metrics_row(pool, g, voice_connected, player_playing, player_paused, live_position):
+        """Fetch per-guild DB counts on its own connection so all guilds run in parallel."""
+        try:
+            async with pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(
+                        """
+                        SELECT
+                            (SELECT COUNT(*) FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard') AS queue_total,
+                            (SELECT COUNT(*) FROM alucard_queue_backup WHERE guild_id = %s AND bot_name = 'alucard') AS backup_total,
+                            ps.is_playing,
+                            ps.is_paused,
+                            ps.position_seconds
+                        FROM (SELECT %s AS guild_id) seed
+                        LEFT JOIN alucard_playback_state ps
+                          ON ps.guild_id = seed.guild_id AND ps.bot_name = 'alucard'
+                        LIMIT 1
+                        """,
+                        (g.id, g.id, g.id),
+                    )
+                    return await cur.fetchone() or {}
+        except Exception:
+            logger.debug("[alucard] Per-guild metrics SELECT failed for guild %s", g.id, exc_info=True)
+            return {}
+
     try:
         async with DBPoolManager() as pool:
+            # Phase 1: fan-out all per-guild SELECTs in parallel (each on its own connection).
+            fetch_results = await asyncio.gather(
+                *[_fetch_guild_metrics_row(pool, g, vc, pp, pa, lp)
+                  for g, _ch, vc, pp, pa, lp, _ld in guild_snapshots],
+                return_exceptions=True,
+            )
+
+            # Phase 2: conditional UPDATEs and bulk REPLACE on one connection.
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
                     metrics_rows = []
-                    for g in guilds:
-                        if not g:
-                            continue
-                        vc = g.voice_client
-                        channel_id = getattr(getattr(vc, "channel", None), "id", None)
-                        voice_connected = bool(vc and _voice_client_connected(vc))
-                        player_playing = bool(vc and _player_is_playing(vc))
-                        player_paused = bool(vc and _player_is_paused(vc))
-                        live_position = current_track_position(g.id) if (player_playing or player_paused or g.id in playback_tracking) else 0
-                        live_duration = int(playback_tracking.get(g.id, {}).get('duration', 0)) if g.id in playback_tracking else 0
-                        await cur.execute(
-                            """
-                            SELECT
-                                (SELECT COUNT(*) FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard') AS queue_total,
-                                (SELECT COUNT(*) FROM alucard_queue_backup WHERE guild_id = %s AND bot_name = 'alucard') AS backup_total,
-                                ps.is_playing,
-                                ps.is_paused,
-                                ps.position_seconds
-                            FROM (SELECT %s AS guild_id) seed
-                            LEFT JOIN alucard_playback_state ps
-                              ON ps.guild_id = seed.guild_id AND ps.bot_name = 'alucard'
-                            LIMIT 1
-                            """,
-                            (g.id, g.id, g.id),
-                        )
-                        metrics_row = await cur.fetchone() or {}
+                    for (g, channel_id, voice_connected, player_playing, player_paused, live_position, live_duration), metrics_row in zip(guild_snapshots, fetch_results):
+                        if isinstance(metrics_row, Exception):
+                            metrics_row = {}
                         if not voice_connected and (metrics_row.get("is_playing") or metrics_row.get("is_paused")):
                             await cur.execute("UPDATE alucard_playback_state SET is_playing = FALSE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'alucard'", (g.id,))
                         elif voice_connected and (player_playing or player_paused or g.id in playback_tracking):
@@ -3796,10 +3827,20 @@ async def delete_live_queue_copies(cur, guild_id, video_url, title, track_uid=No
     different uploads can share a title, and YouTube URL variants can share a
     video id. Select candidate rows first, compare with _track_key(), then
     delete only true identity matches by primary key.
+
+    Fast path: when track_uid is known, use the unique index directly instead
+    of fetching the full guild queue and iterating in Python.
     """
     target_identity = _track_instance_identity(track_uid, video_url, title)
     if not target_identity:
         return 0
+    normalized_uid = _normalize_track_uid(track_uid)
+    if normalized_uid:
+        await cur.execute(
+            "DELETE FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard' AND track_uid = %s",
+            (guild_id, normalized_uid),
+        )
+        return max(0, int(getattr(cur, "rowcount", 0) or 0))
     await cur.execute(
         "SELECT id, video_url, title, track_uid FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard'",
         (guild_id,),
@@ -5195,6 +5236,28 @@ async def _record_track_outcome_parallel(pool, guild_id, track_uri, track_title,
     except Exception:
         logger.debug("[%s] Track intelligence outcome write skipped (parallel).", guild_id, exc_info=True)
 
+
+async def _record_track_play_started_bg(guild_id, video_url, title, requester_id):
+    """Fire-and-forget wrapper: write track_intelligence + user_track_affinity on its own connection."""
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await record_track_play_started(cur, guild_id, video_url, title, requester_id)
+    except Exception:
+        logger.debug("[%s] track_play_started intelligence write skipped (bg).", guild_id, exc_info=True)
+
+
+async def _record_track_play_resumed_bg(guild_id, video_url, title, requester_id):
+    """Fire-and-forget wrapper: write track_intelligence + user_track_affinity on its own connection."""
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await record_track_play_resumed(cur, guild_id, video_url, title, requester_id)
+    except Exception:
+        logger.debug("[%s] track_play_resumed intelligence write skipped (bg).", guild_id, exc_info=True)
+
 @bot.event
 async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     player = getattr(payload, "player", None)
@@ -5535,9 +5598,10 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
 
                 if start_position <= 0:
                     await cur.execute("INSERT INTO alucard_history (guild_id, video_url, title, requester_id) VALUES (%s, %s, %s, %s)", (guild.id, url, title, requester_id))
-                    await record_track_play_started(cur, guild.id, url, title, requester_id)
+                    # Fire-and-forget: intelligence write gets its own connection so playback resumes immediately.
+                    asyncio.ensure_future(_record_track_play_started_bg(guild.id, url, title, requester_id))
                 else:
-                    await record_track_play_resumed(cur, guild.id, url, title, requester_id)
+                    asyncio.ensure_future(_record_track_play_resumed_bg(guild.id, url, title, requester_id))
                 try:
                     await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name=str(title).replace("\\n", " ").strip()[:120]))
                 except Exception as tx_error:
@@ -6112,10 +6176,13 @@ async def on_voice_state_update(member, before, after):
 @tasks.loop(seconds=METRICS_HEARTBEAT_INTERVAL)
 async def metrics_heartbeat_loop():
     prune_runtime_state_cache()
-    for guild in list(bot.guilds):
-        try:
-            await reconcile_runtime_playback_state(guild)
-        except Exception as tx_error:
+    # reconcile_runtime_playback_state acquires its own DBPoolManager connection — safe to gather.
+    reconcile_results = await asyncio.gather(
+        *[reconcile_runtime_playback_state(guild) for guild in list(bot.guilds)],
+        return_exceptions=True,
+    )
+    for guild, result in zip(list(bot.guilds), reconcile_results):
+        if isinstance(result, Exception):
             logger.exception("[alucard] Metrics reconcile failed for guild %s", getattr(guild, 'id', None))
     try:
         await collect_and_persist_metrics()
@@ -6129,47 +6196,143 @@ async def position_updater():
         if not playback_tracking:
             return
         now = time.monotonic()
-        async with DBPoolManager() as pool:
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    for guild_id, data in list(playback_tracking.items()):
-                        last_persist = last_position_persist.get(guild_id, 0.0)
-                        if now - last_persist < POSITION_PERSIST_INTERVAL:
-                            continue
-                        guild = bot.get_guild(int(guild_id)) if bot else None
-                        vc = guild.voice_client if guild else None
-                        connected = bool(vc and _voice_client_connected(vc))
-                        playing = bool(vc and _player_is_playing(vc))
-                        paused = bool(vc and _player_is_paused(vc)) or bool(data.get("paused"))
-                        if connected and (playing or paused):
-                            pos = current_track_position(guild_id)
-                        else:
-                            state_position = (guild_states.get(guild_id) or guild_states.get(str(guild_id)) or {}).get("position", 0)
-                            pos = normalize_position_seconds(data.get("last_position_checkpoint", data.get("offset", state_position)), data.get("duration"))
-                            playing = False
-                            paused = bool(data.get("paused") or data.get("voice_soft_disconnected"))
-                        channel_id = (
-                            getattr(getattr(vc, "channel", None), "id", None)
-                            or data.get("channel_id")
-                            or (guild_states.get(guild_id) or guild_states.get(str(guild_id)) or {}).get("voice_channel_id")
-                        )
-                        try:
-                            await persist_playback_checkpoint(
-                                cur,
-                                guild_id,
-                                data,
-                                pos,
-                                channel_id=channel_id,
-                                playing=playing,
-                                paused=paused,
-                                connected=connected,
+        bot_n = BOT_ENV_PREFIX.lower()
+
+        # Pre-compute all per-guild values (pure in-memory, no DB) and collect
+        # batch rows for the two main writes: playback_state and metrics.
+        playback_state_rows = []   # for executemany REPLACE INTO {bot_n}_playback_state
+        metrics_rows = []          # for executemany INSERT INTO {bot_n}_metrics ON DUPLICATE KEY
+        intelligence_rows = []     # for executemany INSERT INTO {bot_n}_track_intelligence ON DUPLICATE KEY (listen delta)
+        guilds_to_persist = []     # (guild_id, data) pairs that passed the interval check
+
+        for guild_id, data in list(playback_tracking.items()):
+            last_persist = last_position_persist.get(guild_id, 0.0)
+            if now - last_persist < POSITION_PERSIST_INTERVAL:
+                continue
+            guild = bot.get_guild(int(guild_id)) if bot else None
+            vc = guild.voice_client if guild else None
+            connected = bool(vc and _voice_client_connected(vc))
+            playing = bool(vc and _player_is_playing(vc))
+            paused = bool(vc and _player_is_paused(vc)) or bool(data.get("paused"))
+            if connected and (playing or paused):
+                pos = current_track_position(guild_id)
+            else:
+                state_position = (guild_states.get(guild_id) or guild_states.get(str(guild_id)) or {}).get("position", 0)
+                pos = normalize_position_seconds(data.get("last_position_checkpoint", data.get("offset", state_position)), data.get("duration"))
+                playing = False
+                paused = bool(data.get("paused") or data.get("voice_soft_disconnected"))
+            channel_id = (
+                getattr(getattr(vc, "channel", None), "id", None)
+                or data.get("channel_id")
+                or (guild_states.get(guild_id) or guild_states.get(str(guild_id)) or {}).get("voice_channel_id")
+            )
+
+            # Replicate the per-guild logic from persist_playback_checkpoint
+            # (backward-jump guard, normalise, listen-delta) without touching the DB yet.
+            position = normalize_position_seconds(pos, data.get("duration"))
+            url = data.get("url")
+            title = data.get("title")
+            requester_id = data.get("requester_id")
+            track_uid = _ensure_track_uid(data.get("track_uid")) if (url or title or data.get("track_uid")) else None
+            play_session_key = track_uid
+            previous_checkpoint = normalize_position_seconds(data.get("last_position_checkpoint", data.get("offset", 0)), data.get("duration"))
+            if play_session_key and previous_checkpoint > 0 and position + PLAYER_POSITION_BACKSTEP_GRACE_SECONDS < previous_checkpoint:
+                logger.debug(
+                    "[%s] Refusing backwards checkpoint jump for %s from %ss to %ss; keeping %ss.",
+                    guild_id, title or url or "active track", previous_checkpoint, position, previous_checkpoint,
+                )
+                position = previous_checkpoint
+
+            playback_state_rows.append(
+                (guild_id, bot_n, channel_id, url, position, bool(playing), bool(paused), title, play_session_key, track_uid)
+            )
+            metrics_rows.append(
+                (guild_id, bot_n, bool(connected), channel_id, bool(connected), bool(playing), bool(paused), bool(playing), bool(paused), position, guild_id in recovering_guilds)
+            )
+
+            listen_delta = consume_realtime_listen_delta(data, position, playing=bool(playing))
+            if listen_delta > 0 and play_session_key:
+                intelligence_rows.append(
+                    (guild_id, play_session_key, url, title, listen_delta, requester_id)
+                )
+
+            # Update in-memory state immediately (mirrors persist_playback_checkpoint side-effects).
+            data["last_position_checkpoint"] = position
+            data["last_checkpoint_at"] = time.time()
+            if track_uid:
+                data["track_uid"] = track_uid
+            if channel_id:
+                guild_states[guild_id] = {
+                    "voice_channel_id": channel_id,
+                    "position": position,
+                    "track_uid": track_uid,
+                    "url": url,
+                    "title": title,
+                }
+            guilds_to_persist.append(guild_id)
+
+        if not guilds_to_persist:
+            return
+
+        # Single DB round-trip: batch all rows at once.
+        try:
+            async with DBPoolManager() as pool:
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        if playback_state_rows:
+                            await cur.executemany(
+                                f"REPLACE INTO {bot_n}_playback_state (guild_id, bot_name, channel_id, video_url, position_seconds, is_playing, is_paused, title, play_session_key, track_uid) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                                playback_state_rows,
                             )
-                            last_position_persist[guild_id] = now
-                            if now - last_state_file_persist.get(guild_id, 0) >= POSITION_STATE_FILE_INTERVAL:
-                                await save_state(guild_id)
-                                last_state_file_persist[guild_id] = now
-                        except Exception as tx_error:
-                            logger.exception("[%s] Failed to persist realtime playback checkpoint for guild %s.", BOT_ENV_PREFIX.lower(), guild_id)
+                        if metrics_rows:
+                            await cur.executemany(
+                                f"""
+                                INSERT INTO {bot_n}_metrics
+                                    (guild_id, bot_name, voice_connected, connected_channel_id, player_connected, player_playing, player_paused,
+                                     is_playing_db, is_paused_db, position_seconds, recovery_pending)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                ON DUPLICATE KEY UPDATE
+                                    voice_connected = VALUES(voice_connected),
+                                    connected_channel_id = VALUES(connected_channel_id),
+                                    player_connected = VALUES(player_connected),
+                                    player_playing = VALUES(player_playing),
+                                    player_paused = VALUES(player_paused),
+                                    is_playing_db = VALUES(is_playing_db),
+                                    is_paused_db = VALUES(is_paused_db),
+                                    position_seconds = VALUES(position_seconds),
+                                    recovery_pending = VALUES(recovery_pending)
+                                """,
+                                metrics_rows,
+                            )
+                        if intelligence_rows:
+                            await cur.executemany(
+                                f"""
+                                INSERT INTO {bot_n}_track_intelligence
+                                    (guild_id, url_key, video_url, title, total_listen_seconds, last_requester_id, last_played, source)
+                                VALUES (%s, %s, %s, %s, %s, %s, NOW(), 'playback_checkpoint')
+                                ON DUPLICATE KEY UPDATE
+                                    video_url = VALUES(video_url),
+                                    title = VALUES(title),
+                                    total_listen_seconds = total_listen_seconds + VALUES(total_listen_seconds),
+                                    last_requester_id = VALUES(last_requester_id),
+                                    last_played = NOW(),
+                                    source = 'playback_checkpoint'
+                                """,
+                                intelligence_rows,
+                            )
+        except Exception as tx_error:
+            logger.exception("[%s] Failed to batch-persist realtime playback checkpoints.", BOT_ENV_PREFIX.lower())
+            return
+
+        # Post-persist: update timestamps and flush state files.
+        for guild_id in guilds_to_persist:
+            last_position_persist[guild_id] = now
+            if now - last_state_file_persist.get(guild_id, 0) >= POSITION_STATE_FILE_INTERVAL:
+                try:
+                    await save_state(guild_id)
+                except Exception as tx_error:
+                    logger.exception("[%s] Failed to save state file for guild %s.", BOT_ENV_PREFIX.lower(), guild_id)
+                last_state_file_persist[guild_id] = now
     except Exception as tx_error:
         logger.exception("[%s] Position updater failed.", BOT_ENV_PREFIX.lower())
 
@@ -8223,6 +8386,18 @@ async def database_janitor_loop():
                     if deleted_rows > 0:
                         logger.info(f"🧹 Janitor cleared {deleted_rows} old history records.")
                         await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "🧹 Database Janitor", f"Successfully cleared **{deleted_rows}** old song history records to optimize database speed.", discord.Color.blurple())
+                    await cur.execute(
+                        "DELETE FROM alucard_smart_recommendations WHERE created_at < NOW() - INTERVAL 90 DAY"
+                    )
+                    await cur.execute(
+                        "DELETE FROM alucard_error_events WHERE created_at < NOW() - INTERVAL 30 DAY"
+                    )
+                    await cur.execute(
+                        "DELETE FROM alucard_track_intelligence WHERE last_played < NOW() - INTERVAL 365 DAY AND play_count <= 1 AND finish_count = 0"
+                    )
+                    await cur.execute(
+                        "DELETE FROM alucard_user_track_affinity WHERE last_requested < NOW() - INTERVAL 365 DAY AND play_count <= 1"
+                    )
     except Exception as e:
         logger.error(f"Janitor Error: {e}")
 
