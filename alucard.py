@@ -705,6 +705,11 @@ RESUME_SEEK_RETRY_DELAY_SECONDS = max(0.5, float(os.getenv(f"{BOT_ENV_PREFIX}_RE
 RESUME_SEEK_VERIFY_GRACE_SECONDS = max(2, int(os.getenv(f"{BOT_ENV_PREFIX}_RESUME_SEEK_VERIFY_GRACE_SECONDS", os.getenv("RESUME_SEEK_VERIFY_GRACE_SECONDS", "8"))))
 SHUTDOWN_POSITION_FLUSH_TIMEOUT_SECONDS = max(3.0, float(os.getenv(f"{BOT_ENV_PREFIX}_SHUTDOWN_POSITION_FLUSH_TIMEOUT_SECONDS", os.getenv("SHUTDOWN_POSITION_FLUSH_TIMEOUT_SECONDS", "8"))))
 PLAYLIST_SYNC_INTERVAL = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_PLAYLIST_SYNC_INTERVAL", os.getenv("PLAYLIST_SYNC_INTERVAL", "30"))))
+# playlist_sync_loop's diff only reacts to changes in the SOURCE playlist relative to its own
+# stored snapshot, so a live queue drained/wiped by anything else (playback, a bug, a restart)
+# while the source playlist itself hasn't changed would never get topped back up. Independently
+# keep at least this many (or the whole playlist, if smaller) tracked-playlist tracks queued.
+PLAYLIST_QUEUE_MIN_TRACKS = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_PLAYLIST_QUEUE_MIN_TRACKS", os.getenv("PLAYLIST_QUEUE_MIN_TRACKS", "20"))))
 AUTO_HEAL_INTERVAL = max(15.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_HEAL_INTERVAL", "20")))
 AUTO_IMPORT_IDLE_SECONDS = max(45.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_IMPORT_IDLE_SECONDS", "45")))
 RECOVERY_RETRY_BASE_DELAY = max(2.0, float(os.getenv(f"{BOT_ENV_PREFIX}_RECOVERY_RETRY_BASE_DELAY", os.getenv("RECOVERY_RETRY_BASE_DELAY", "3"))))
@@ -957,6 +962,7 @@ recent_track_requeues = {}
 queue_playback_claims = {}
 recovery_exhausted_until = {}
 voice_disconnect_grace_tasks = {}
+sleep_timer_tasks = {}
 interrupt_resume_tasks = {}
 interrupt_resume_armed_until = {}
 idle_voice_since = {}
@@ -977,6 +983,7 @@ AUTO_DJ_ENABLED_CACHE = {}
 GUILD_SETTINGS_CACHE = {}
 HOME_CHANNEL_CACHE = {}
 SEARCH_RESULT_CACHE = {}
+SEARCH_SUGGEST_CACHE = {}
 VOICE_STATUS_CACHE = {}
 STATUS_MESSAGE_CACHE = {}
 VOICE_STATE_PERSIST_CACHE = {}
@@ -988,6 +995,7 @@ AUTO_DJ_CACHE_TTL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_AUTO_DJ_
 GUILD_SETTINGS_CACHE_TTL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_GUILD_SETTINGS_CACHE_TTL_SECONDS", os.getenv("GUILD_SETTINGS_CACHE_TTL_SECONDS", "30"))))
 HOME_CHANNEL_CACHE_TTL_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_HOME_CHANNEL_CACHE_TTL_SECONDS", os.getenv("HOME_CHANNEL_CACHE_TTL_SECONDS", "30"))))
 SEARCH_CACHE_TTL_SECONDS = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_SEARCH_CACHE_TTL_SECONDS", os.getenv("SEARCH_CACHE_TTL_SECONDS", "900"))))
+SEARCH_SUGGEST_CACHE_TTL_SECONDS = max(30.0, float(os.getenv(f"{BOT_ENV_PREFIX}_SEARCH_SUGGEST_CACHE_TTL_SECONDS", os.getenv("SEARCH_SUGGEST_CACHE_TTL_SECONDS", "300"))))
 VOICE_STATUS_DEDUP_SECONDS = max(10.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_STATUS_DEDUP_SECONDS", os.getenv("VOICE_STATUS_DEDUP_SECONDS", "60"))))
 STATUS_MESSAGE_DEDUP_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_STATUS_MESSAGE_DEDUP_SECONDS", os.getenv("STATUS_MESSAGE_DEDUP_SECONDS", "20"))))
 VOICE_STATE_DEDUP_SECONDS = max(5.0, float(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_STATE_DEDUP_SECONDS", os.getenv("VOICE_STATE_DEDUP_SECONDS", "12"))))
@@ -1366,6 +1374,46 @@ async def close_shared_runtime_resources():
     except Exception as tx_error:
         logger.debug("[%s] Failed closing DB pool.", BOT_ENV_PREFIX.lower(), exc_info=True)
 
+MAINTENANCE_ANNOUNCE_TIMEOUT_SECONDS = 5.0
+
+
+async def announce_maintenance_to_active_guilds(reason: str):
+    """Best-effort notice in each guild currently listening that the bot is restarting.
+
+    Runs under a hard timeout so a slow/rate-limited Discord API call never delays
+    the shutdown/restart path this is called from.
+    """
+    friendly_reason = str(reason or "maintenance").replace("_", " ")
+    embed = discord.Embed(
+        title="🛠️ Restarting for maintenance",
+        description=(
+            f"This node is restarting ({friendly_reason}). Playback and queue state are "
+            "saved and playback will resume automatically once it's back."
+        ),
+        color=discord.Color.orange(),
+    )
+
+    async def _send_all():
+        for guild in list(getattr(bot, "guilds", []) or []):
+            vc = guild.voice_client
+            if not vc or not vc.is_connected():
+                continue
+            track_data = playback_tracking.get(guild.id, {})
+            channel_id = track_data.get("channel_id") or guild_states.get(guild.id, {}).get("voice_channel_id")
+            channel = bot.get_channel(channel_id) if channel_id else None
+            if not channel:
+                continue
+            try:
+                await channel.send(embed=embed)
+            except Exception:
+                continue
+
+    try:
+        await asyncio.wait_for(_send_all(), timeout=MAINTENANCE_ANNOUNCE_TIMEOUT_SECONDS)
+    except Exception:
+        logger.debug("[%s] Maintenance announcement pass did not fully complete.", BOT_ENV_PREFIX.lower(), exc_info=True)
+
+
 async def request_supervisor_restart(reason: str, *, announce: bool = True):
     logger.warning("[%s] Restart requested (%s); exiting for container supervisor restart.", BOT_ENV_PREFIX.lower(), reason)
     # Same hang risk as flush_and_close_for_shutdown: this is called from background
@@ -1387,6 +1435,10 @@ async def request_supervisor_restart(reason: str, *, announce: bool = True):
             )
         except Exception as tx_error:
             logger.debug("[%s] Failed to publish restart webhook.", BOT_ENV_PREFIX.lower(), exc_info=True)
+        try:
+            await announce_maintenance_to_active_guilds(reason)
+        except Exception:
+            logger.debug("[%s] Failed to announce maintenance restart to active guilds.", BOT_ENV_PREFIX.lower(), exc_info=True)
     try:
         await bot.close()
     except Exception:
@@ -1412,6 +1464,10 @@ async def flush_and_close_for_shutdown(reason: str = "signal"):
         await asyncio.wait_for(flush_runtime_state_before_restart(reason), timeout=SHUTDOWN_POSITION_FLUSH_TIMEOUT_SECONDS)
     except Exception as tx_error:
         logger.exception("[%s] Timed out or failed while flushing playback checkpoints for %s.", BOT_ENV_PREFIX.lower(), reason)
+    try:
+        await announce_maintenance_to_active_guilds(reason)
+    except Exception:
+        logger.debug("[%s] Failed to announce maintenance shutdown to active guilds.", BOT_ENV_PREFIX.lower(), exc_info=True)
     try:
         await bot.close()
     except Exception as tx_error:
@@ -1454,6 +1510,7 @@ def install_shutdown_signal_handlers():
 
 
 vote_skip_sessions = {}
+queue_vote_state = {}
 metrics_last_errors = {}
 METRICS_HEARTBEAT_INTERVAL = max(5, int(os.getenv(f"{BOT_ENV_PREFIX}_METRICS_HEARTBEAT_INTERVAL", os.getenv("METRICS_HEARTBEAT_INTERVAL", "15"))))
 VOICE_REJOIN_DELAY_SECONDS = max(1, int(os.getenv(f"{BOT_ENV_PREFIX}_VOICE_REJOIN_DELAY_SECONDS", os.getenv("VOICE_REJOIN_DELAY_SECONDS", "2"))))
@@ -2010,6 +2067,39 @@ async def resolve_requester_name(guild, requester_id):
     except Exception as tx_error:
         fallback = f"User {requester_id}"
         return _cache_set(REQUESTER_NAME_CACHE, cache_key, fallback)
+
+
+TRACK_DROP_DM_REASONS = {
+    "track_exception": "it kept hitting a playback error (often YouTube blocking or throttling the stream)",
+    "track_stuck": "the stream repeatedly stalled and wouldn't recover",
+}
+
+
+async def dm_requester_track_dropped(guild, requester_id, title, reason=None):
+    """Best-effort DM to the user whose track was permanently dropped after exhausting retries."""
+    if not requester_id or (bot.user and int(requester_id) == bot.user.id):
+        return
+    try:
+        user = bot.get_user(int(requester_id)) or await bot.fetch_user(int(requester_id))
+    except Exception:
+        return
+    if not user:
+        return
+    why = TRACK_DROP_DM_REASONS.get(str(reason or "").strip().lower(), "it kept failing to play")
+    guild_name = getattr(guild, "name", "your server")
+    safe_title = str(title or "Your track")[:200]
+    embed = discord.Embed(
+        title="⚠️ We had to skip your track",
+        description=(
+            f"**{safe_title}** in **{guild_name}** wouldn't play after {MAX_TRACK_FAILURE_REQUEUES} "
+            f"attempts, so we're sorry but we had to skip it — {why}."
+        ),
+        color=discord.Color.orange(),
+    )
+    try:
+        await user.send(embed=embed)
+    except Exception:
+        pass
 
 
 async def get_autodj_enabled(guild_id):
@@ -2589,6 +2679,59 @@ def _clean_smart_title(title):
     cleaned = re.sub(r"(?i)\b(official|video|audio|lyrics?|visualizer|remaster(?:ed)?|hd|hq|mv)\b", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -_|")
     return cleaned[:120]
+
+
+_LRC_LINE_RE = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\](.*)$")
+
+
+def _parse_synced_lyrics(lrc_text):
+    lines = []
+    for raw in (lrc_text or "").splitlines():
+        m = _LRC_LINE_RE.match(raw.strip())
+        if not m:
+            continue
+        minutes, seconds, text = m.groups()
+        text = text.strip()
+        if text:
+            lines.append((int(minutes) * 60 + float(seconds), text))
+    lines.sort(key=lambda pair: pair[0])
+    return lines
+
+
+async def fetch_lyrics(title, duration=None):
+    """Best-effort lyrics lookup against LRCLIB (no API key required)."""
+    query = _clean_smart_title(title)
+    if not query:
+        return None
+    try:
+        async with HTTPSessionManager() as session:
+            async with session.get(
+                "https://lrclib.net/api/search",
+                params={"q": query},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                results = await resp.json()
+    except Exception:
+        return None
+    if not results:
+        return None
+    best = results[0]
+    if duration:
+        close = [r for r in results if r.get("duration") and abs(r["duration"] - duration) <= 5]
+        if close:
+            best = close[0]
+    synced = best.get("syncedLyrics")
+    plain = best.get("plainLyrics")
+    if not synced and not plain:
+        return None
+    return {
+        "synced": _parse_synced_lyrics(synced) if synced else None,
+        "plain": plain,
+        "track_name": best.get("trackName"),
+        "artist_name": best.get("artistName"),
+    }
 
 
 def _smart_query_from_title(title):
@@ -3997,6 +4140,28 @@ async def snapshot_queue_backup(cur, guild_id):
             _row_value(row, "requester_id", _row_value(row, 2)),
             normalized_uid,
         ))
+
+    # Preserve the currently-playing track's backup row even though it's already gone from the
+    # live queue by design (_process_queue_inner dequeues at play-start, before this function is
+    # ever called). This is exactly the in-flight state queue_integrity_check_loop's crash
+    # recovery depends on finding in backup ("a track was dequeued at play-start but the bot
+    # crashed before it finished"). Without this, ANY routine queue rebuild that fires while a
+    # track is playing (/play, /playnext, /shuffle, playlist sync, ...) silently destroys its only
+    # safety net, since this function's rebuild otherwise mirrors backup to live exactly.
+    current = playback_tracking.get(guild_id)
+    if current and current.get("url"):
+        current_uid = _ensure_track_uid(current.get("track_uid"))
+        if current_uid not in seen_track_uids:
+            seen_track_uids.add(current_uid)
+            insert_data.append((
+                guild_id,
+                'alucard',
+                current.get("url"),
+                current.get("title"),
+                current.get("requester_id"),
+                current_uid,
+            ))
+
     try:
         await cur.execute("START TRANSACTION")
         await cur.execute("DELETE FROM alucard_queue_backup WHERE guild_id = %s AND bot_name = 'alucard'", (guild_id,))
@@ -4246,7 +4411,7 @@ async def dedupe_queue_table_by_track_key(cur, table_name, *, guild_id=None, bot
     return deleted
 
 
-QUEUE_DUPLICATE_CAP = int(os.getenv("QUEUE_DUPLICATE_CAP", "2"))
+QUEUE_DUPLICATE_CAP = int(os.getenv("QUEUE_DUPLICATE_CAP", "8"))
 
 
 async def trim_queue_duplicate_runs(cur, table_name, *, guild_id=None, bot_name=None, max_copies=QUEUE_DUPLICATE_CAP):
@@ -5243,6 +5408,7 @@ async def apply_resume_seek(voice_client, guild_id, start_position, *, track_uid
 async def requeue_verified_playback_failure(guild, channel_id, url, title, requester_id, position, *, reason="track_exception", track_uid=None):
     attempts = mark_track_failure(guild.id, track_uid if track_uid else url, title)
     inserted = False
+    dropped = False
     async with DBPoolManager() as pool:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -5283,7 +5449,10 @@ async def requeue_verified_playback_failure(guild, channel_id, url, title, reque
                         title,
                         MAX_TRACK_FAILURE_REQUEUES,
                     )
+                    dropped = True
 
+    if dropped:
+        schedule_named_task(f"track_drop_dm:{guild.id}:{position}", dm_requester_track_dropped(guild, requester_id, title, reason=reason))
     if channel_id:
         schedule_named_task(f"lavalink_failure_process_queue:{guild.id}", process_queue(guild, channel_id, allow_recovery_restore=True))
     return True
@@ -5829,8 +5998,10 @@ async def ensure_voice_connection(guild, channel_id, *, respect_recovery_backoff
 
             if isinstance(channel, discord.StageChannel):
                 if guild.me.voice and guild.me.voice.suppress:
-                    try: await guild.me.edit(suppress=False)
-                    except Exception as tx_error: pass
+                    try:
+                        await guild.me.edit(suppress=False)
+                    except Exception as tx_error:
+                        logger.warning(f"[{guild.id}] Could not clear stage suppression on connect (bot may lack Stage Moderator permission): {tx_error}")
 
             await persist_voice_state(guild.id, channel_id, desired_connected=True, connected=True)
             clear_recovery_backoff(guild.id)
@@ -5936,6 +6107,24 @@ async def _record_track_play_resumed_bg(guild_id, video_url, title, requester_id
         logger.debug("[%s] track_play_resumed intelligence write skipped (bg).", guild_id, exc_info=True)
 
 @bot.event
+async def on_wavelink_track_start(payload):
+    # TEMP DIAGNOSTIC: log the EXACT track Lavalink actually started, per guild/channel/session,
+    # to catch any case where the audio diverges from what the bot intended. Remove after debugging.
+    try:
+        player = getattr(payload, "player", None)
+        track = getattr(payload, "track", None)
+        guild = getattr(player, "guild", None)
+        node = getattr(player, "node", None)
+        vchan = getattr(getattr(player, "channel", None), "id", None)
+        logger.warning("[TRACKDBG] bot=%s guild=%s vchan=%s session=%s ident=%s len=%s title=%r uri=%s",
+                       BOT_ENV_PREFIX.lower(), getattr(guild, "id", None), vchan,
+                       getattr(node, "session_id", None), getattr(track, "identifier", None),
+                       getattr(track, "length", None), getattr(track, "title", None), getattr(track, "uri", None))
+    except Exception:
+        pass
+
+
+@bot.event
 async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     player = getattr(payload, "player", None)
     if not player:
@@ -6001,6 +6190,18 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
                                         original_title = track_data.get('original_queue_title')
                                         if original_url and original_title and (original_url != track_uri or original_title != track_title):
                                             await delete_backup_track(cur, guild.id, video_url=original_url, title=original_title)
+                                else:
+                                    # Track left playback for a reason other than natural completion (e.g.
+                                    # STOPPED from /skip or vote-skip, or an unrecovered LOAD_FAILED/CLEANUP).
+                                    # It is gone from live for good -- loop-mode's repeat semantics must not
+                                    # re-add it, and its backup mirror needs cleanup so it doesn't accumulate
+                                    # as a stale row that repair_queue_backup_parity later resurrects.
+                                    if track_uri and track_title:
+                                        await delete_backup_track(cur, guild.id, track_uid=resolved_track_uid, video_url=track_uri, title=track_title)
+                                    original_url = track_data.get('original_queue_url')
+                                    original_title = track_data.get('original_queue_title')
+                                    if original_url and original_title and (original_url != track_uri or original_title != track_title):
+                                        await delete_backup_track(cur, guild.id, video_url=original_url, title=original_title)
                     break
                 except Exception as _track_end_exc:
                     if _is_retryable_mysql_error(_track_end_exc) and _track_end_attempt < 2:
@@ -6060,7 +6261,12 @@ async def on_wavelink_websocket_closed(payload: wavelink.WebsocketClosedEventPay
                 dedupe_key=f"ws_closed:{track_data.get('track_uid')}:{position // 15}",
                 fields=_track_feedback_fields(track_data.get("track_uid"), position),
             )
-        schedule_targeted_interrupt_resume(guild.id, channel_id, start_position=position, reason="wavelink_websocket_closed")
+        scheduled = schedule_targeted_interrupt_resume(guild.id, channel_id, start_position=position, reason="wavelink_websocket_closed")
+        if not scheduled and VOICE_DISCONNECT_REJOIN_RECOVERY and not ARIA_RECOVERY_AUTHORITY:
+            # Targeted resume silently no-ops when its cooldown/min-position gates aren't met (e.g.
+            # a second glitch within the 20s arm window) -- fall back to soft recovery instead of
+            # leaving this disconnect with zero recovery attempts scheduled.
+            schedule_soft_voice_recovery(guild.id, channel_id, start_position=position, reason="wavelink_websocket_closed_fallback")
     elif VOICE_DISCONNECT_REJOIN_RECOVERY and not ARIA_RECOVERY_AUTHORITY:
         schedule_soft_voice_recovery(guild.id, channel_id, start_position=position, reason="wavelink_websocket_closed")
     else:
@@ -6198,8 +6404,10 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                     return
 
                 wav_filters = wavelink.Filters()
+                effective_vol = _apply_loudness_gain(vol, _lookup_loudness_gain_db(url))
+                outgoing_track_data = playback_tracking.get(guild.id)
                 try:
-                    await voice_client.set_volume(vol)
+                    await voice_client.set_volume(effective_vol)
 
                     if c_mod_left > 0:
                         wav_filters.timescale.set(speed=c_speed, pitch=c_pitch)
@@ -6211,7 +6419,7 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
 
                     await replace_audio_filters(voice_client, wav_filters)
 
-                    if trans_mode in {'fade', 'smart'} and start_position <= 0:
+                    if trans_mode in {'fade', 'smart', 'mix'} and start_position <= 0:
                         await voice_client.set_volume(0)
                 except Exception as e:
                     logger.error(f"[{guild.id}] Player preparation failed for '{title}': {e}")
@@ -6250,9 +6458,16 @@ async def _process_queue_inner(guild, channel_id, start_position=0, *, allow_rec
                             video_url=url,
                             title=title,
                         )
-                    elif trans_mode in {'fade', 'smart'}:
+                    elif trans_mode in {'fade', 'smart', 'mix'}:
                         fade_duration = choose_fade_duration(trans_mode, fade_seconds, duration, filter_mode, title)
-                        schedule_named_task(f"fade_volume:{guild.id}", _fade_volume(voice_client, 0, vol, duration=fade_duration, curve=fade_curve), overwrite=True)
+                        if trans_mode == 'mix':
+                            outgoing_bpm = _lookup_bpm((outgoing_track_data or {}).get('url'))
+                            incoming_bpm = _lookup_bpm(url)
+                            if _bpm_compatible(outgoing_bpm, incoming_bpm):
+                                fade_duration = _beat_aligned_fade_duration(incoming_bpm, fade_seconds)
+                            else:
+                                fade_duration = 0.6
+                        schedule_named_task(f"fade_volume:{guild.id}", _fade_volume(voice_client, 0, effective_vol, duration=fade_duration, curve=fade_curve), overwrite=True)
                 except Exception as e:
                     logger.error(f"[{guild.id}] Playback start failed for '{title}': {e}")
                     playback_tracking.pop(guild.id, None)
@@ -6846,6 +7061,16 @@ async def on_voice_state_update(member, before, after):
             clear_interrupt_resume(guild_id)
             unfreeze_playback_after_voice_return(guild_id)
             await persist_voice_state(guild_id, after.channel.id, desired_connected=True, connected=True)
+            if isinstance(after.channel, discord.StageChannel) and after.suppress:
+                # Discord (or a stage moderator) demoted the bot back to audience -- Lavalink keeps
+                # streaming and the bot's internal state still says "connected and playing," but no
+                # audio actually reaches the stage until suppression is cleared again. The one-shot
+                # attempt at connect time can't catch this; this event fires on the suppress flip.
+                try:
+                    await member.guild.me.edit(suppress=False)
+                    logger.info(f"[{guild_id}] Re-cleared stage suppression after a voice-state update.")
+                except Exception as tx_error:
+                    logger.warning(f"[{guild_id}] Could not clear stage suppression (bot may lack Stage Moderator permission): {tx_error}")
             await asyncio.sleep(0.5)
             await reconcile_runtime_playback_state(member.guild)
             return
@@ -6860,7 +7085,23 @@ async def on_voice_state_update(member, before, after):
             or getattr(before.channel, "id", None)
         )
 
-        if (tracked or guild_id in guild_states) and remembered_channel_id:
+        stay_in_vc = False
+        if not (tracked or guild_id in guild_states):
+            # An idling 24/7 guild has no tracked/guild_states entry (both get popped on
+            # queue-empty), so without this check any transient disconnect here -- a Discord
+            # hiccup, a mod action, a network drop -- was being treated identically to a
+            # deliberate /leave and the bot would never auto-rejoin even with stay_in_vc on.
+            try:
+                async with DBPoolManager() as pool:
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute("SELECT stay_in_vc FROM alucard_guild_settings WHERE guild_id = %s", (guild_id,))
+                            stay_row = await cur.fetchone()
+                            stay_in_vc = bool(stay_row[0]) if stay_row else False
+            except Exception:
+                stay_in_vc = False
+
+        if (tracked or guild_id in guild_states or stay_in_vc) and remembered_channel_id:
             position = current_track_position(guild_id)
             if not VOICE_DISCONNECT_REJOIN_RECOVERY:
                 recovering_guilds.discard(guild_id)
@@ -7183,8 +7424,49 @@ async def restart_bot(interaction: discord.Interaction):
 
 # --- COMMAND SURFACE: slash handlers should stay thin and delegate to runtime helpers above. ---
 # --- PLAYBACK COMMANDS ---
+async def _youtube_search_suggestions(query):
+    """Best-effort YouTube 'suggest' lookup for /play autocomplete; never raises, always fast."""
+    cleaned = str(query or "").strip()
+    if len(cleaned) < 2 or _is_explicit_lavalink_query(cleaned):
+        return []
+    cache_key = cleaned.casefold()
+    cached = _cache_get(SEARCH_SUGGEST_CACHE, cache_key, SEARCH_SUGGEST_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached
+    try:
+        async with HTTPSessionManager() as session:
+            async with session.get(
+                "https://suggestqueries.google.com/complete/search",
+                params={"client": "firefox", "ds": "yt", "q": cleaned},
+                timeout=aiohttp.ClientTimeout(total=1.5),
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json(content_type=None)
+        suggestions = [str(s) for s in (data[1] if len(data) > 1 else []) if str(s).strip()][:10]
+    except Exception:
+        return []
+    _cache_set(SEARCH_SUGGEST_CACHE, cache_key, suggestions)
+    return suggestions
+
+
+async def play_search_autocomplete(interaction: discord.Interaction, current: str):
+    suggestions = await _youtube_search_suggestions(current)
+    if not suggestions and current.strip():
+        suggestions = [current.strip()]
+    return [app_commands.Choice(name=s[:100], value=s[:100]) for s in suggestions[:10]]
+
+
 @bot.tree.command(name="alucard_main_play", description="Queue a track, URL, livestream, search result, or playlist and start playback if idle.")
-async def play(interaction: discord.Interaction, search: str):
+@app_commands.describe(search="Track name, URL, or search text", source="Where to search (defaults to YouTube for plain text)")
+@app_commands.choices(source=[
+    app_commands.Choice(name="YouTube", value="ytmsearch"),
+    app_commands.Choice(name="SoundCloud", value="scsearch"),
+])
+@app_commands.autocomplete(search=play_search_autocomplete)
+async def play(interaction: discord.Interaction, search: str, source: str = "ytmsearch"):
+    if source in {"ytmsearch", "scsearch"} and not _is_explicit_lavalink_query(search):
+        search = f"{source}:{search}"
     interaction_token_valid = True
     try:
         await interaction.response.defer()
@@ -7232,24 +7514,28 @@ async def play(interaction: discord.Interaction, search: str):
     queue_rows = [(track.uri, track.title, interaction.user.id, _new_track_uid()) for track in entries_to_add]
     added_count = len(queue_rows)
 
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await prime_loop_queue_defaults(cur, interaction.guild.id)
-                if queue_rows:
-                    await cur.executemany(
-                        "INSERT INTO alucard_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
-                        [(interaction.guild.id, 'alucard', url, title, requester_id, track_uid) for url, title, requester_id, track_uid in queue_rows],
-                    )
-                    try:
-                        await bulk_record_tracks_queued(cur, interaction.guild.id, [(url, title, requester_id) for url, title, requester_id, _track_uid in queue_rows])
-                    except Exception as tx_error:
-                        logger.debug("[alucard] Bulk track intelligence queue write skipped.", exc_info=True)
-                if added_count > 1:
-                    await shuffle_queue_rows(cur, interaction.guild.id, preserve_first=True)
-                await snapshot_queue_backup(cur, interaction.guild.id)
-                await cur.execute("SELECT COUNT(*) FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard'", (interaction.guild.id,))
-                q_len = (await cur.fetchone())[0]
+    # Hold the same lock process_queue uses so a concurrent dequeue/insert (or another command's
+    # rebuild) can't be silently dropped by this insert-then-shuffle-then-snapshot sequence
+    # (queue leak fix).
+    async with get_process_queue_lock(interaction.guild.id):
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await prime_loop_queue_defaults(cur, interaction.guild.id)
+                    if queue_rows:
+                        await cur.executemany(
+                            "INSERT INTO alucard_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
+                            [(interaction.guild.id, 'alucard', url, title, requester_id, track_uid) for url, title, requester_id, track_uid in queue_rows],
+                        )
+                        try:
+                            await bulk_record_tracks_queued(cur, interaction.guild.id, [(url, title, requester_id) for url, title, requester_id, _track_uid in queue_rows])
+                        except Exception as tx_error:
+                            logger.debug("[alucard] Bulk track intelligence queue write skipped.", exc_info=True)
+                    if added_count > 1:
+                        await shuffle_queue_rows(cur, interaction.guild.id, preserve_first=True)
+                    await snapshot_queue_backup(cur, interaction.guild.id)
+                    await cur.execute("SELECT COUNT(*) FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard'", (interaction.guild.id,))
+                    q_len = (await cur.fetchone())[0]
     if playlist_url:
         await set_active_playlist(interaction.guild.id, playlist_url, len(entries_to_add), interaction.user.id, channel.id, entries_to_add)
 
@@ -7334,6 +7620,45 @@ async def stop(interaction: discord.Interaction):
     await stop_playback(interaction.guild)
     await clear_active_playlist(interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(title="⏹️ Stopped", description="Music stopped and cleared.", color=discord.Color.red()), ephemeral=True)
+
+@bot.tree.command(name="alucard_main_sleep", description="Stop playback and disconnect after N minutes. Use 0 to cancel an active timer.")
+@app_commands.describe(minutes="Minutes until playback stops automatically (0 cancels the current timer)")
+async def sleep_timer_cmd(interaction: discord.Interaction, minutes: app_commands.Range[int, 0, 240]):
+    if not await is_dj(interaction): return
+    guild_id = interaction.guild.id
+    existing_task = sleep_timer_tasks.pop(guild_id, None)
+    if existing_task and not existing_task.done():
+        existing_task.cancel()
+    if minutes <= 0:
+        await interaction.response.send_message(embed=discord.Embed(description="⏰ Sleep timer cancelled.", color=discord.Color.orange()), ephemeral=True)
+        return
+
+    channel_id = interaction.channel_id
+
+    async def _sleep_and_stop():
+        try:
+            await asyncio.sleep(minutes * 60)
+        except asyncio.CancelledError:
+            return
+        sleep_timer_tasks.pop(guild_id, None)
+        guild = bot.get_guild(guild_id)
+        if not guild or not guild.voice_client:
+            return
+        process_queue_locks.pop(guild_id, None)
+        voice_connect_locks.pop(guild_id, None)
+        snooze_auto_restore(guild_id)
+        await stop_playback(guild)
+        await clear_active_playlist(guild_id)
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if channel:
+            try:
+                await channel.send(embed=discord.Embed(title="😴 Sleep Timer", description="Playback stopped — sleep timer elapsed.", color=discord.Color.dark_purple()))
+            except Exception as tx_error:
+                pass
+        await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "😴 Sleep Timer", f"Guild {guild.name}: sleep timer elapsed, playback stopped.", discord.Color.dark_purple())
+
+    sleep_timer_tasks[guild_id] = asyncio.get_event_loop().create_task(_sleep_and_stop())
+    await interaction.response.send_message(embed=discord.Embed(description=f"😴 Sleep timer set for **{minutes}** minute(s). Playback will stop automatically.", color=discord.Color.blue()), ephemeral=True)
 
 @bot.tree.command(name="alucard_main_pause", description="Pause the current track without clearing the queue or playback position.")
 async def pause(interaction: discord.Interaction):
@@ -7470,16 +7795,48 @@ async def queue_cmd(interaction: discord.Interaction, page: int = 1):
 @bot.tree.command(name="alucard_main_shuffle", description="Smart-shuffle the upcoming queue while keeping duplicate tracks separated when possible.")
 async def shuffle(interaction: discord.Interaction):
     if not await is_dj(interaction): return
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                queue_len = await shuffle_queue_rows(cur, interaction.guild.id, preserve_first=False)
-                if queue_len <= 0:
-                    return await interaction.response.send_message("Queue empty.", ephemeral=True)
-                await snapshot_queue_backup(cur, interaction.guild.id)
+    # Hold the same lock process_queue uses so a concurrent dequeue/insert can't be silently
+    # dropped by this command's rebuild-live-queue sequence (queue leak fix).
+    async with get_process_queue_lock(interaction.guild.id):
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    queue_len = await shuffle_queue_rows(cur, interaction.guild.id, preserve_first=False)
+                    if queue_len <= 0:
+                        return await interaction.response.send_message("Queue empty.", ephemeral=True)
+                    await snapshot_queue_backup(cur, interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(description=f"🔀 Smart-shuffled {queue_len} queued track(s), keeping repeat tracks apart where possible.", color=discord.Color.green()), ephemeral=True)
 
+async def _queue_index_autocomplete(interaction: discord.Interaction, current: str):
+    guild = interaction.guild
+    if not guild:
+        return []
+    try:
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT video_url, title FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard' ORDER BY id ASC LIMIT 200",
+                        (guild.id,),
+                    )
+                    rows = await cur.fetchall() or []
+    except Exception:
+        return []
+    needle = current.strip().lower()
+    choices = []
+    for position, row in enumerate(rows, start=1):
+        title = _row_value(row, "title", _row_value(row, 1, "")) or "Unknown title"
+        if needle and needle != str(position) and needle not in title.lower():
+            continue
+        label = _compact_track_title(f"{position}. {title}", limit=95)
+        choices.append(app_commands.Choice(name=label, value=position))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
 @bot.tree.command(name="alucard_main_remove", description="Remove a queued track by its queue number so it will not play later.")
+@app_commands.autocomplete(index=_queue_index_autocomplete)
 async def remove(interaction: discord.Interaction, index: int):
     if not await is_dj(interaction): return
     if index < 1:
@@ -7497,6 +7854,7 @@ async def remove(interaction: discord.Interaction, index: int):
                 else: await interaction.response.send_message("Invalid index.", ephemeral=True)
 
 @bot.tree.command(name="alucard_main_skipto", description="Drop everything before a chosen queue position and jump playback forward to that track.")
+@app_commands.autocomplete(index=_queue_index_autocomplete)
 async def skipto(interaction: discord.Interaction, index: int):
     if not await is_dj(interaction): return
     if index < 1:
@@ -7535,63 +7893,71 @@ async def skipto(interaction: discord.Interaction, index: int):
     await interaction.followup.send(embed=discord.Embed(description=f"Skipped to #{index}", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="alucard_main_move", description="Move a queued track from one queue slot to another without rebuilding the entire session manually.")
+@app_commands.autocomplete(frm=_queue_index_autocomplete, to=_queue_index_autocomplete)
 async def move(interaction: discord.Interaction, frm: int, to: int):
     if not await is_dj(interaction): return
     await interaction.response.defer(ephemeral=True)
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT id, video_url, title, requester_id, track_uid FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard' ORDER BY id ASC", (interaction.guild.id,))
-                q_rows = list(await cur.fetchall())
-                if frm > len(q_rows) or to > len(q_rows) or frm < 1 or to < 1:
-                    return await interaction.followup.send("Invalid index", ephemeral=True)
-                item = q_rows.pop(frm - 1)
-                insert_at = to - 1
-                q_rows.insert(max(0, min(insert_at, len(q_rows))), item)
-                insert_data = [(
-                    interaction.guild.id,
-                    'alucard',
-                    _row_value(row, "video_url", _row_value(row, 1)),
-                    _row_value(row, "title", _row_value(row, 2)),
-                    _row_value(row, "requester_id", _row_value(row, 3)),
-                    _ensure_track_uid(_row_track_uid(row, 4)),
-                ) for row in q_rows]
-                try:
-                    await cur.execute("START TRANSACTION")
-                    await cur.execute("DELETE FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard'", (interaction.guild.id,))
-                    if insert_data:
-                        await cur.executemany(
-                            "INSERT INTO alucard_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
-                            insert_data,
-                        )
-                    await snapshot_queue_backup(cur, interaction.guild.id)
-                    await cur.execute("COMMIT")
-                except Exception as tx_error:
+    # Hold the same lock process_queue uses so a concurrent dequeue/insert can't be silently
+    # dropped by this command's read-snapshot-then-blind-rebuild sequence (queue leak fix).
+    async with get_process_queue_lock(interaction.guild.id):
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT id, video_url, title, requester_id, track_uid FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard' ORDER BY id ASC", (interaction.guild.id,))
+                    q_rows = list(await cur.fetchall())
+                    if frm > len(q_rows) or to > len(q_rows) or frm < 1 or to < 1:
+                        return await interaction.followup.send("Invalid index", ephemeral=True)
+                    item = q_rows.pop(frm - 1)
+                    insert_at = to - 1
+                    q_rows.insert(max(0, min(insert_at, len(q_rows))), item)
+                    insert_data = [(
+                        interaction.guild.id,
+                        'alucard',
+                        _row_value(row, "video_url", _row_value(row, 1)),
+                        _row_value(row, "title", _row_value(row, 2)),
+                        _row_value(row, "requester_id", _row_value(row, 3)),
+                        _ensure_track_uid(_row_track_uid(row, 4)),
+                    ) for row in q_rows]
                     try:
-                        await cur.execute("ROLLBACK")
+                        await cur.execute("START TRANSACTION")
+                        await cur.execute("DELETE FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard'", (interaction.guild.id,))
+                        if insert_data:
+                            await cur.executemany(
+                                "INSERT INTO alucard_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
+                                insert_data,
+                            )
+                        await snapshot_queue_backup(cur, interaction.guild.id)
+                        await cur.execute("COMMIT")
                     except Exception as tx_error:
-                        pass
-                    logger.exception("[alucard] move transaction failed; queue was rolled back instead of leaking tracks.")
-                    raise
+                        try:
+                            await cur.execute("ROLLBACK")
+                        except Exception as tx_error:
+                            pass
+                        logger.exception("[alucard] move transaction failed; queue was rolled back instead of leaking tracks.")
+                        raise
     await interaction.followup.send(embed=discord.Embed(description=f"Moved item from {frm} to {to}", color=discord.Color.green()), ephemeral=True)
 
 
 
 @bot.tree.command(name="alucard_main_bump", description="Move a queued track to the front so it plays next")
+@app_commands.autocomplete(index=_queue_index_autocomplete)
 async def bump(interaction: discord.Interaction, index: int):
     if not await is_dj(interaction): return
     if index < 1:
         return await interaction.response.send_message("Invalid index.", ephemeral=True)
-    async with DBPoolManager() as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT id, video_url, title, requester_id, track_uid FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard' ORDER BY id ASC LIMIT 1 OFFSET %s", (interaction.guild.id, index-1))
-                row = await cur.fetchone()
-                if not row:
-                    return await interaction.response.send_message("Invalid index.", ephemeral=True)
-                await cur.execute("DELETE FROM alucard_queue WHERE id = %s AND guild_id = %s AND bot_name = 'alucard'", (row[0], interaction.guild.id))
-                await insert_queue_front(cur, "alucard_queue", interaction.guild.id, "alucard", row[1], row[2], row[3], _row_track_uid(row, 4))
-                await snapshot_queue_backup(cur, interaction.guild.id)
+    # Hold the same lock process_queue uses so a concurrent dequeue/insert can't be silently
+    # dropped by this command's read-then-rebuild sequence (queue leak fix).
+    async with get_process_queue_lock(interaction.guild.id):
+        async with DBPoolManager() as pool:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT id, video_url, title, requester_id, track_uid FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard' ORDER BY id ASC LIMIT 1 OFFSET %s", (interaction.guild.id, index-1))
+                    row = await cur.fetchone()
+                    if not row:
+                        return await interaction.response.send_message("Invalid index.", ephemeral=True)
+                    await cur.execute("DELETE FROM alucard_queue WHERE id = %s AND guild_id = %s AND bot_name = 'alucard'", (row[0], interaction.guild.id))
+                    await insert_queue_front(cur, "alucard_queue", interaction.guild.id, "alucard", row[1], row[2], row[3], _row_track_uid(row, 4))
+                    await snapshot_queue_backup(cur, interaction.guild.id)
     await interaction.response.send_message(embed=discord.Embed(description=f"⬆️ Moved **{row[2]}** to play next.", color=discord.Color.green()), ephemeral=True)
 
 @bot.tree.command(name="alucard_main_clearmine", description="Remove your own queued songs without touching other listeners' tracks")
@@ -7628,6 +7994,95 @@ async def voteskip(interaction: discord.Interaction):
         await vc.stop()
         return await interaction.response.send_message(embed=discord.Embed(description=f"⏭️ Vote skip passed with **{len(votes)}/{required}** votes.", color=discord.Color.green()))
     await interaction.response.send_message(embed=discord.Embed(description=f"🗳️ Vote recorded: **{len(votes)}/{required}** votes to skip.", color=discord.Color.blurple()), ephemeral=True)
+
+@bot.tree.command(name="alucard_main_upvote", description="Upvote a queued track; enough listener upvotes bump it to play next.")
+async def upvote(interaction: discord.Interaction, index: int):
+    vc = interaction.guild.voice_client
+    if not vc or not getattr(vc, 'channel', None):
+        return await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+    listeners = [m for m in vc.channel.members if not m.bot]
+    if interaction.user not in listeners:
+        return await interaction.response.send_message("Join the same voice channel first.", ephemeral=True)
+    if index < 1:
+        return await interaction.response.send_message("Invalid index.", ephemeral=True)
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT id, video_url, title, requester_id, track_uid FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard' ORDER BY id ASC LIMIT 1 OFFSET %s", (interaction.guild.id, index - 1))
+                row = await cur.fetchone()
+                if not row:
+                    return await interaction.response.send_message("Invalid index.", ephemeral=True)
+                key = (interaction.guild.id, row[0])
+                votes = queue_vote_state.setdefault(key, {"up": set(), "down": set()})
+                votes["down"].discard(interaction.user.id)
+                votes["up"].add(interaction.user.id)
+                required = max(2, (len(listeners) // 2) + 1)
+                if len(votes["up"]) >= required:
+                    queue_vote_state.pop(key, None)
+                    await cur.execute("DELETE FROM alucard_queue WHERE id = %s AND guild_id = %s AND bot_name = 'alucard'", (row[0], interaction.guild.id))
+                    await insert_queue_front(cur, "alucard_queue", interaction.guild.id, "alucard", row[1], row[2], row[3], _row_track_uid(row, 4))
+                    await snapshot_queue_backup(cur, interaction.guild.id)
+                    return await interaction.response.send_message(embed=discord.Embed(description=f"⬆️ **{row[2]}** got enough upvotes and will play next!", color=discord.Color.green()))
+                up_count, req = len(votes["up"]), required
+    await interaction.response.send_message(embed=discord.Embed(description=f"🔺 Upvoted **#{index}** ({up_count}/{req}) to play next.", color=discord.Color.blurple()), ephemeral=True)
+
+@bot.tree.command(name="alucard_main_downvote", description="Downvote a queued track; enough listener downvotes removes it from the queue.")
+async def downvote(interaction: discord.Interaction, index: int):
+    vc = interaction.guild.voice_client
+    if not vc or not getattr(vc, 'channel', None):
+        return await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+    listeners = [m for m in vc.channel.members if not m.bot]
+    if interaction.user not in listeners:
+        return await interaction.response.send_message("Join the same voice channel first.", ephemeral=True)
+    if index < 1:
+        return await interaction.response.send_message("Invalid index.", ephemeral=True)
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT id, video_url, title, track_uid FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard' ORDER BY id ASC LIMIT 1 OFFSET %s", (interaction.guild.id, index - 1))
+                row = await cur.fetchone()
+                if not row:
+                    return await interaction.response.send_message("Invalid index.", ephemeral=True)
+                key = (interaction.guild.id, row[0])
+                votes = queue_vote_state.setdefault(key, {"up": set(), "down": set()})
+                votes["up"].discard(interaction.user.id)
+                votes["down"].add(interaction.user.id)
+                required = max(2, (len(listeners) // 2) + 1)
+                if len(votes["down"]) >= required:
+                    queue_vote_state.pop(key, None)
+                    await cur.execute("DELETE FROM alucard_queue WHERE id = %s AND guild_id = %s AND bot_name = 'alucard'", (row[0], interaction.guild.id))
+                    await delete_backup_track(cur, interaction.guild.id, track_uid=_row_track_uid(row, 3), video_url=row[1], title=row[2])
+                    return await interaction.response.send_message(embed=discord.Embed(description=f"⬇️ **{row[2]}** got enough downvotes and was removed from the queue.", color=discord.Color.orange()))
+                down_count, req = len(votes["down"]), required
+    await interaction.response.send_message(embed=discord.Embed(description=f"🔻 Downvoted **#{index}** ({down_count}/{req}).", color=discord.Color.blurple()), ephemeral=True)
+
+@bot.tree.command(name="alucard_main_radio", description="Queue several tracks matching a mood or vibe, e.g. 'chill lofi' or 'workout hype'.")
+async def radio(interaction: discord.Interaction, mood: str, count: app_commands.Range[int, 1, 10] = 5):
+    await interaction.response.defer()
+    channel = interaction.user.voice.channel if interaction.user.voice else None
+    if not channel:
+        return await interaction.followup.send(embed=discord.Embed(description="Join a voice channel first.", color=discord.Color.red()))
+    try:
+        entries_to_add, _playlist_result = await search_playables(f"{mood.strip()[:100]} mix")
+    except Exception as e:
+        return await interaction.followup.send(embed=discord.Embed(description=f"Could not load tracks for **{mood}**: {e}", color=discord.Color.red()))
+    entries_to_add = [t for t in entries_to_add if t][:count]
+    if not entries_to_add:
+        return await interaction.followup.send(embed=discord.Embed(description=f"Couldn't find tracks for **{mood}**.", color=discord.Color.red()))
+    queue_rows = [(track.uri, track.title, interaction.user.id, _new_track_uid()) for track in entries_to_add]
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await prime_loop_queue_defaults(cur, interaction.guild.id)
+                await cur.executemany(
+                    "INSERT INTO alucard_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
+                    [(interaction.guild.id, 'alucard', url, title, requester_id, track_uid) for url, title, requester_id, track_uid in queue_rows],
+                )
+                await snapshot_queue_backup(cur, interaction.guild.id)
+    vc = interaction.guild.voice_client
+    if not vc or (not getattr(vc, 'playing', False) and not getattr(vc, 'paused', False)):
+        await process_queue(interaction.guild, channel.id)
+    await interaction.followup.send(embed=discord.Embed(title="📻 Mood Radio", description=f"Queued **{len(queue_rows)}** track(s) for the vibe: *{mood}*.", color=discord.Color.green()))
 
 @bot.tree.command(name="alucard_main_autodj", description="Enable or disable smarter Auto-DJ recommendations when the queue runs dry")
 async def autodj(interaction: discord.Interaction, enabled: bool):
@@ -8125,11 +8580,12 @@ async def filter_cmd(interaction: discord.Interaction, mode: str):
     label = next((c.name for c in FILTER_PRESET_CHOICES if c.value == mode), mode)
     await interaction.followup.send(embed=discord.Embed(description=f"🎛️ Filter set to: **{label}**.", color=discord.Color.blurple()), ephemeral=True)
 
-@bot.tree.command(name="alucard_main_fade", description="Customize track fade transitions or let the bot pick smart fade timing.")
+@bot.tree.command(name="alucard_main_fade", description="Customize track fade transitions, let the bot pick smart fade timing, or enable BPM-matched mixing.")
 @app_commands.describe(mode="Fade mode", seconds="Fade length in seconds, from 0.5 to 20", curve="Volume curve")
 @app_commands.choices(mode=[
     app_commands.Choice(name="Smart Adaptive Fades", value="smart"),
     app_commands.Choice(name="Custom Fades", value="fade"),
+    app_commands.Choice(name="Beat-Matched Mixing", value="mix"),
     app_commands.Choice(name="Disable Fades", value="off")
 ], curve=[
     app_commands.Choice(name="Linear", value="linear"),
@@ -8139,7 +8595,7 @@ async def filter_cmd(interaction: discord.Interaction, mode: str):
 ])
 async def toggle_fade(interaction: discord.Interaction, mode: str, seconds: float = 3.0, curve: str = "smooth"):
     if not await is_dj(interaction): return
-    if mode not in {'off', 'fade', 'smart'}:
+    if mode not in {'off', 'fade', 'smart', 'mix'}:
         return await interaction.response.send_message("Invalid fade mode.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     curve = curve if curve in {'linear', 'smooth', 'ease_in', 'ease_out'} else 'smooth'
@@ -8154,6 +8610,9 @@ async def toggle_fade(interaction: discord.Interaction, mode: str, seconds: floa
         color = discord.Color.green()
     elif mode == "fade":
         message = f"🌊 Custom fades enabled: {seconds:g}s using {curve.replace('_', ' ')}."
+        color = discord.Color.green()
+    elif mode == "mix":
+        message = "🎚️ Beat-matched mixing enabled. Transitions between tracks with compatible BPM use a beat-aligned fade; mismatched tempos get a quick clean cut instead. Only cached (previously played) tracks have a known BPM."
         color = discord.Color.green()
     else:
         message = "⏹️ Smooth fades disabled."
@@ -8227,10 +8686,40 @@ async def replay(interaction: discord.Interaction):
     await interaction.response.send_message(embed=discord.Embed(description="Replaying song.", color=discord.Color.green()), ephemeral=True)
 
 # --- UTILITY & INFO ---
+async def build_panel_embed(guild):
+    async with DBPoolManager() as pool:
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT volume, loop_mode FROM alucard_guild_settings WHERE guild_id = %s", (guild.id,))
+                row = await cur.fetchone()
+    vol, loop_mode = row if row else (100, 'queue')
+    embed = discord.Embed(title="🎛️ ALUCARD Music Control Panel", color=discord.Color.from_rgb(43, 45, 49))
+    data = playback_tracking.get(guild.id)
+    if data:
+        cur_t = current_track_position(guild.id)
+        p_bar = make_progress_bar(cur_t, data.get('duration', 0))
+        title = data.get('title') or 'Playing'
+        url = data.get('url')
+        now_playing = f"**[{title}]({url})**" if url else f"**{title}**"
+        embed.add_field(name="Now Playing", value=f"{now_playing}\n`{p_bar}`", inline=False)
+        requester_id = data.get('requester_id')
+        if requester_id:
+            embed.add_field(name="Requested by", value=await resolve_requester_name(guild, requester_id), inline=True)
+        embed.add_field(name="Filter", value=str(data.get('current_filter', 'none')), inline=True)
+    else:
+        embed.description = "Nothing is playing right now."
+    embed.add_field(name="Volume", value=f"{vol}%", inline=True)
+    embed.add_field(name="Loop", value=str(loop_mode), inline=True)
+    embed.set_footer(text="ALUCARD Main Music System")
+    return embed
+
+
 @bot.tree.command(name="alucard_main_panel", description="Post an interactive control panel with playback, queue, and transport buttons.")
 async def panel(interaction: discord.Interaction):
     class AdvancedPanel(discord.ui.View):
         def __init__(self): super().__init__(timeout=None)
+        async def _refresh(self, i: discord.Interaction):
+            await i.response.edit_message(embed=await build_panel_embed(i.guild), view=self)
         @discord.ui.button(label="⏯️ Play/Pause", style=discord.ButtonStyle.primary, row=0)
         async def pr(self, i: discord.Interaction, _button: discord.ui.Button):
             if not await is_dj(i): return
@@ -8239,11 +8728,10 @@ async def panel(interaction: discord.Interaction):
                 if _player_is_playing(vc):
                     await vc.pause(True)
                     await sync_pause_state(i.guild.id, True)
-                    await i.response.send_message("⏸️ Playback Paused", ephemeral=True)
                 else:
                     await vc.pause(False)
                     await sync_pause_state(i.guild.id, False)
-                    await i.response.send_message("▶️ Playback Resumed", ephemeral=True)
+                await self._refresh(i)
             else: await i.response.send_message("Nothing is playing.", ephemeral=True)
         @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, row=0)
         async def st(self, i: discord.Interaction, _button: discord.ui.Button):
@@ -8252,7 +8740,7 @@ async def panel(interaction: discord.Interaction):
             await stop_playback(i.guild)
             _f_t = startup_task_registry.get(f"fade_volume:{i.guild.id}");
             if _f_t and not _f_t.done(): _f_t.cancel()
-            await i.response.send_message("⏹️ Stopped and cleared state", ephemeral=True)
+            await self._refresh(i)
         @discord.ui.button(label="⏭️ Skip", style=discord.ButtonStyle.secondary, row=0)
         async def sk(self, i: discord.Interaction, _button: discord.ui.Button):
             if not await is_dj(i): return
@@ -8260,7 +8748,7 @@ async def panel(interaction: discord.Interaction):
                 await i.guild.voice_client.stop()
                 _f_t = startup_task_registry.get(f"fade_volume:{i.guild.id}")
                 if _f_t and not _f_t.done(): _f_t.cancel()
-                await i.response.send_message("⏹️ Skipped to next track", ephemeral=True)
+                await i.response.send_message("⏭️ Skipped to next track", ephemeral=True)
             else:
                 await i.response.send_message("Nothing to skip.", ephemeral=True)
         @discord.ui.button(label="⏪ -10s", style=discord.ButtonStyle.secondary, row=1)
@@ -8272,7 +8760,7 @@ async def panel(interaction: discord.Interaction):
             if i.guild.voice_client:
                 await i.guild.voice_client.seek(new_pos * 1000)
                 await reset_runtime_position_after_seek(i.guild.id, new_pos, getattr(getattr(i.guild.voice_client, "channel", None), "id", None))
-            await i.response.send_message("Rewound 10 seconds.", ephemeral=True)
+            await self._refresh(i)
         @discord.ui.button(label="⏩ +10s", style=discord.ButtonStyle.secondary, row=1)
         async def fw(self, i: discord.Interaction, _button: discord.ui.Button):
             if not await is_dj(i): return
@@ -8282,17 +8770,52 @@ async def panel(interaction: discord.Interaction):
             if i.guild.voice_client:
                 await i.guild.voice_client.seek(new_pos * 1000)
                 await reset_runtime_position_after_seek(i.guild.id, new_pos, getattr(getattr(i.guild.voice_client, "channel", None), "id", None))
-            await i.response.send_message("Skipped forward 10 seconds.", ephemeral=True)
+            await self._refresh(i)
+        @discord.ui.button(label="🔉 Vol-", style=discord.ButtonStyle.secondary, row=1)
+        async def voldown(self, i: discord.Interaction, _button: discord.ui.Button):
+            if not await is_dj(i): return
+            await self._adjust_volume(i, -10)
+        @discord.ui.button(label="🔊 Vol+", style=discord.ButtonStyle.secondary, row=1)
+        async def volup(self, i: discord.Interaction, _button: discord.ui.Button):
+            if not await is_dj(i): return
+            await self._adjust_volume(i, 10)
+        async def _adjust_volume(self, i: discord.Interaction, delta: int):
+            async with DBPoolManager() as pool:
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("SELECT volume FROM alucard_guild_settings WHERE guild_id = %s", (i.guild.id,))
+                        row = await cur.fetchone()
+                        vol = max(1, min(200, (row[0] if row and row[0] else 100) + delta))
+                        await cur.execute("INSERT INTO alucard_guild_settings (guild_id, volume) VALUES (%s, %s) ON DUPLICATE KEY UPDATE volume = %s", (i.guild.id, vol, vol))
+            if i.guild.voice_client:
+                try: await i.guild.voice_client.set_volume(vol)
+                except Exception: pass
+            await self._refresh(i)
+        @discord.ui.button(label="🔁 Loop", style=discord.ButtonStyle.secondary, row=2)
+        async def loop_toggle(self, i: discord.Interaction, _button: discord.ui.Button):
+            if not await is_dj(i): return
+            async with DBPoolManager() as pool:
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("SELECT loop_mode FROM alucard_guild_settings WHERE guild_id = %s", (i.guild.id,))
+                        row = await cur.fetchone()
+                        current_mode = row[0] if row and row[0] else 'queue'
+                        next_mode = {'off': 'queue', 'queue': 'song', 'song': 'off'}.get(current_mode, 'queue')
+                        await cur.execute("INSERT INTO alucard_guild_settings (guild_id, loop_mode) VALUES (%s, %s) ON DUPLICATE KEY UPDATE loop_mode = %s", (i.guild.id, next_mode, next_mode))
+            await self._refresh(i)
         @discord.ui.button(label="🔀 Shuffle", style=discord.ButtonStyle.success, row=2)
         async def shuf(self, i: discord.Interaction, _button: discord.ui.Button):
             if not await is_dj(i): return
             await i.response.defer(ephemeral=True)
-            async with DBPoolManager() as pool:
-                async with pool.acquire() as conn:
-                    async with conn.cursor() as cur:
-                        queue_len = await shuffle_queue_rows(cur, i.guild.id, preserve_first=False)
-                        if not queue_len: return await i.followup.send("Queue empty.")
-                        await snapshot_queue_backup(cur, i.guild.id)
+            # Hold the same lock process_queue uses so a concurrent dequeue/insert can't be
+            # silently dropped by this rebuild-live-queue sequence (queue leak fix).
+            async with get_process_queue_lock(i.guild.id):
+                async with DBPoolManager() as pool:
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cur:
+                            queue_len = await shuffle_queue_rows(cur, i.guild.id, preserve_first=False)
+                            if not queue_len: return await i.followup.send("Queue empty.")
+                            await snapshot_queue_backup(cur, i.guild.id)
             await i.followup.send("🔀 Queue successfully shuffled!")
         @discord.ui.button(label="📜 View Queue", style=discord.ButtonStyle.secondary, row=2)
         async def vq(self, i: discord.Interaction, _button: discord.ui.Button):
@@ -8305,9 +8828,41 @@ async def panel(interaction: discord.Interaction):
             if songs: await i.followup.send("**Current Queue:**\n" + "\n".join(f"{idx+1}. {s[0]}" for idx, s in enumerate(songs)))
             else: await i.followup.send("Queue is empty.")
 
-    embed = discord.Embed(title="🎛️ ALUCARD Music Control Panel", description="Manage your audio playback directly from these buttons.", color=discord.Color.from_rgb(43, 45, 49))
-    embed.set_footer(text="ALUCARD Main Music System")
+    embed = await build_panel_embed(interaction.guild)
     await interaction.response.send_message(embed=embed, view=AdvancedPanel())
+
+@bot.tree.command(name="alucard_main_lyrics", description="Show lyrics for the currently playing track, synced to the current position when available.")
+async def lyrics_cmd(interaction: discord.Interaction):
+    data = playback_tracking.get(interaction.guild.id)
+    if not data:
+        return await interaction.response.send_message(embed=discord.Embed(description="Nothing is playing.", color=discord.Color.red()), ephemeral=True)
+    await interaction.response.defer()
+    title = data.get('title') or 'Unknown'
+    result = await fetch_lyrics(title, data.get('duration'))
+    if not result:
+        return await interaction.followup.send(embed=discord.Embed(description=f"No lyrics found for **{title}**.", color=discord.Color.red()))
+    embed = discord.Embed(title=f"📜 {result.get('track_name') or title}", color=discord.Color.blue())
+    if result.get('artist_name'):
+        embed.set_author(name=result['artist_name'])
+    synced = result.get('synced')
+    if synced:
+        pos = current_track_position(interaction.guild.id)
+        current_idx = 0
+        for idx, (ts, _line) in enumerate(synced):
+            if ts <= pos:
+                current_idx = idx
+            else:
+                break
+        window_start = max(0, current_idx - 2)
+        body = []
+        for idx in range(window_start, min(len(synced), current_idx + 5)):
+            line_text = synced[idx][1]
+            body.append(f"**{line_text}**" if idx == current_idx else line_text)
+        embed.description = "\n".join(body)[:4000] or "…"
+        embed.set_footer(text="Synced to current playback position — rerun to refresh.")
+    else:
+        embed.description = (result.get('plain') or "No lyrics text available.")[:4000]
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="alucard_main_nowplaying", description="Show the current track, progress bar, requester, and live playback status.")
 async def nowplaying(interaction: discord.Interaction):
@@ -8690,6 +9245,165 @@ def _audio_cache_drop(cache_id):
         return
     for ext in _AUDIO_CACHE_EXTS:
         _safe_unlink(os.path.join(AUDIO_CACHE_DIR, f"{cache_id}.{ext}"))
+    _safe_unlink(os.path.join(AUDIO_CACHE_DIR, f"{cache_id}.gain"))
+    _safe_unlink(os.path.join(AUDIO_CACHE_DIR, f"{cache_id}.bpm"))
+
+
+# --- Loudness normalization: EBU R128 gain matching for cached tracks. ---
+# Measured once per track (piggybacked on the existing local-cache download, which the
+# 13 bots already share) and stashed as a tiny sidecar file next to the cached audio so
+# every bot benefits from a single ffmpeg pass. First play of a brand-new track has no
+# measurement yet and plays at the guild's plain volume; repeat plays get gain-matched.
+LOUDNESS_TARGET_LUFS = float(os.getenv("LOUDNESS_TARGET_LUFS", "-14"))
+LOUDNESS_MAX_GAIN_DB = float(os.getenv("LOUDNESS_MAX_GAIN_DB", "8"))
+
+
+def _measure_and_write_loudness_gain(cache_id, path):
+    """Best-effort single-pass ffmpeg loudnorm analysis; never raises."""
+    if not cache_id or not AUDIO_CACHE_DIR:
+        return
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-i", path, "-af",
+             f"loudnorm=I={LOUDNESS_TARGET_LUFS}:TP=-1.5:LRA=11:print_format=json",
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60,
+        )
+        stderr = proc.stderr or ""
+        start, end = stderr.rfind("{"), stderr.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            return
+        measured = json.loads(stderr[start:end + 1])
+        input_i = float(measured.get("input_i"))
+        gain_db = max(-LOUDNESS_MAX_GAIN_DB, min(LOUDNESS_MAX_GAIN_DB, LOUDNESS_TARGET_LUFS - input_i))
+        gain_path = os.path.join(AUDIO_CACHE_DIR, f"{cache_id}.gain")
+        tmp_path = f"{gain_path}.tmp-{os.getpid()}"
+        with open(tmp_path, "w") as f:
+            f.write(f"{gain_db:.2f}")
+        os.replace(tmp_path, gain_path)
+    except Exception:
+        logger.debug("[%s] Loudness measurement failed for %s.", BOT_ENV_PREFIX.lower(), cache_id, exc_info=True)
+
+
+def _lookup_loudness_gain_db(url):
+    if not AUDIO_CACHE_ENABLED or not AUDIO_CACHE_DIR:
+        return None
+    cache_id = _audio_cache_id(url)
+    if not cache_id:
+        return None
+    try:
+        with open(os.path.join(AUDIO_CACHE_DIR, f"{cache_id}.gain"), "r") as f:
+            return float(f.read().strip())
+    except Exception:
+        return None
+
+
+def _apply_loudness_gain(vol, gain_db):
+    if gain_db is None:
+        return vol
+    try:
+        return max(1, min(200, round(vol * (10 ** (gain_db / 20)))))
+    except Exception:
+        return vol
+
+
+# --- BPM-matched mixing: tempo detection for the 'mix' transition mode. ---
+# Same piggyback-on-cache-download pattern as loudness: measured once per track via
+# aubio's beat tracker, stashed as a sidecar file next to the cached audio. Lavalink/
+# wavelink only support one active track per player, so this cannot produce a true
+# overlapping dual-audio crossfade — instead, when the outgoing and incoming tracks'
+# BPM are compatible, the transition uses a beat-aligned fade duration (a whole number
+# of beats at the shared tempo) instead of a fixed/heuristic one; on a tempo clash it
+# falls back to a quick clean cut rather than a mismatched overlap.
+BPM_ANALYSIS_MAX_SECONDS = float(os.getenv("BPM_ANALYSIS_MAX_SECONDS", "60"))
+BPM_MATCH_TOLERANCE_PCT = float(os.getenv("BPM_MATCH_TOLERANCE_PCT", "6"))
+
+
+def _measure_and_write_bpm(cache_id, path):
+    """Best-effort BPM estimate via aubio's tempo tracker; never raises.
+
+    aubio's pip build only links its plain WAV reader (no libavcodec/libsndfile
+    metadata available in this image), so it cannot read the cached .opus file
+    directly. Pre-decode a short mono PCM WAV with ffmpeg — already a hard
+    dependency here — and hand that to aubio instead.
+    """
+    if not cache_id or not AUDIO_CACHE_DIR:
+        return
+    wav_path = os.path.join(AUDIO_CACHE_DIR, f".bpm-scratch-{cache_id}-{os.getpid()}.wav")
+    try:
+        import aubio
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", path, "-t", str(int(BPM_ANALYSIS_MAX_SECONDS)),
+             "-ac", "1", "-ar", "22050", "-f", "wav", wav_path],
+            capture_output=True, timeout=60,
+        )
+        if proc.returncode != 0 or not os.path.isfile(wav_path):
+            return
+        hop_s = 512
+        src = aubio.source(wav_path, 0, hop_s)
+        samplerate = src.samplerate
+        tempo_o = aubio.tempo("specdiff", hop_s * 2, hop_s, samplerate)
+        beat_times = []
+        total_frames = 0
+        max_frames = samplerate * BPM_ANALYSIS_MAX_SECONDS
+        while True:
+            samples, read = src()
+            if tempo_o(samples):
+                beat_times.append(total_frames / float(samplerate))
+            total_frames += read
+            if read < hop_s or total_frames >= max_frames:
+                break
+        if len(beat_times) < 2:
+            return
+        intervals = sorted(b - a for a, b in zip(beat_times[:-1], beat_times[1:]) if b > a)
+        if not intervals:
+            return
+        median_interval = intervals[len(intervals) // 2]
+        if median_interval <= 0:
+            return
+        bpm = 60.0 / median_interval
+        while bpm < 70:
+            bpm *= 2
+        while bpm > 180:
+            bpm /= 2
+        bpm_path = os.path.join(AUDIO_CACHE_DIR, f"{cache_id}.bpm")
+        tmp_path = f"{bpm_path}.tmp-{os.getpid()}"
+        with open(tmp_path, "w") as f:
+            f.write(f"{bpm:.1f}")
+        os.replace(tmp_path, bpm_path)
+    except Exception:
+        logger.debug("[%s] BPM measurement failed for %s.", BOT_ENV_PREFIX.lower(), cache_id, exc_info=True)
+    finally:
+        _safe_unlink(wav_path)
+
+
+def _lookup_bpm(url):
+    if not AUDIO_CACHE_ENABLED or not AUDIO_CACHE_DIR or not url:
+        return None
+    cache_id = _audio_cache_id(url)
+    if not cache_id:
+        return None
+    try:
+        with open(os.path.join(AUDIO_CACHE_DIR, f"{cache_id}.bpm"), "r") as f:
+            return float(f.read().strip())
+    except Exception:
+        return None
+
+
+def _bpm_compatible(bpm_a, bpm_b, tolerance_pct=None):
+    if not bpm_a or not bpm_b:
+        return False
+    tolerance_pct = BPM_MATCH_TOLERANCE_PCT if tolerance_pct is None else tolerance_pct
+    for candidate in (bpm_b, bpm_b * 2, bpm_b / 2):
+        if candidate > 0 and abs(bpm_a - candidate) / bpm_a * 100 <= tolerance_pct:
+            return True
+    return False
+
+
+def _beat_aligned_fade_duration(bpm, fallback_seconds, beats=4):
+    if not bpm or bpm <= 0:
+        return max(0.25, min(12.0, float(fallback_seconds or 3.0)))
+    return max(0.25, min(12.0, (60.0 / bpm) * beats))
 
 
 def _is_local_cache_uri(uri):
@@ -8869,6 +9583,8 @@ def _audio_cache_fetch_and_normalize(cache_id, url, final):
         if not _audio_cache_validate(produced):
             logger.warning("[%s] Audio cache rejected %s: failed integrity validation.", BOT_ENV_PREFIX.lower(), cache_id)
             return None
+        _measure_and_write_loudness_gain(cache_id, produced)
+        _measure_and_write_bpm(cache_id, produced)
         if _audio_cache_publish_ready(final):
             return final
         os.replace(produced, final)  # atomic — Lavalink never sees a partial file
@@ -9252,6 +9968,7 @@ async def playlist_sync_loop():
                                             purged_backup = 0
                                             trim_count = 0
                                             backup_content_trim = 0
+                                            refilled_count = 0
                                             break
 
                                     added_rows = []
@@ -9320,6 +10037,11 @@ async def playlist_sync_loop():
                                             await bulk_record_tracks_queued(cur, guild_id, [(u, t, r) for u, t, r, _k, _uid in added_rows])
                                         except Exception as tx_error:
                                             logger.debug("[alucard] Bulk playlist-sync intelligence write skipped.", exc_info=True)
+                                        # Mirror to backup immediately, not just once at the end of this
+                                        # block -- otherwise a concurrent parity repair can see these
+                                        # brand-new live rows as backup-less "surplus" and delete them
+                                        # from live before backup ever catches up (queue leak fix).
+                                        await snapshot_queue_backup(cur, guild_id)
                                         if added_count > 1:
                                             await shuffle_queue_rows(cur, guild_id, preserve_first=True)
 
@@ -9359,7 +10081,51 @@ async def playlist_sync_loop():
                                     if backup_content_trim > 0:
                                         logger.info("[alucard] Playlist sync removed %s content-duplicate backup row(s) for guild %s.", backup_content_trim, guild_id)
 
-                                    if added_rows or purged_live or purged_backup or trim_count or backup_content_trim:
+                                    # Queue-health enforcement: everything above only reacts to CHANGES in
+                                    # the source playlist relative to the stored snapshot, so a live queue
+                                    # that's been drained or wiped by something else (playback, a bug, a
+                                    # restart) while the source playlist itself hasn't changed would never
+                                    # get topped back up — added_rows stays empty since nothing "changed"
+                                    # from this diff's point of view. Independently verify the queue still
+                                    # holds a healthy chunk of the tracked playlist and refill from the
+                                    # current snapshot when it doesn't, regardless of added/removed above.
+                                    await cur.execute(
+                                        "SELECT video_url, title FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard'",
+                                        (guild_id,),
+                                    )
+                                    _queued_keys = {
+                                        _track_key(_row_value(r, 'video_url', _row_value(r, 0)), _row_value(r, 'title', _row_value(r, 1)))
+                                        for r in (await cur.fetchall() or [])
+                                    }
+                                    _refill_target = min(current_count, PLAYLIST_QUEUE_MIN_TRACKS)
+                                    refill_rows = []
+                                    refilled_count = 0
+                                    if len(_queued_keys) < _refill_target:
+                                        for row in current_rows:
+                                            if len(_queued_keys) + len(refill_rows) >= _refill_target:
+                                                break
+                                            if row[3] not in _queued_keys:
+                                                refill_rows.append(row)
+                                        if refill_rows:
+                                            await cur.executemany(
+                                                "INSERT INTO alucard_queue (guild_id, bot_name, video_url, title, requester_id, track_uid) VALUES (%s, %s, %s, %s, %s, %s)",
+                                                [(guild_id, 'alucard', t_url, t_title, t_req, track_uid) for t_url, t_title, t_req, _key, track_uid in refill_rows],
+                                            )
+                                            try:
+                                                await bulk_record_tracks_queued(cur, guild_id, [(u, t, r) for u, t, r, _k, _uid in refill_rows])
+                                            except Exception as tx_error:
+                                                logger.debug("[alucard] Bulk playlist-sync intelligence write skipped (refill).", exc_info=True)
+                                            refilled_count = len(refill_rows)
+                                            # Mirror to backup immediately -- see the added_rows snapshot
+                                            # above for why (queue leak fix).
+                                            await snapshot_queue_backup(cur, guild_id)
+                                            await shuffle_queue_rows(cur, guild_id, preserve_first=True)
+                                            logger.warning(
+                                                "[%s] Playlist sync: live queue was thin (%s/%s tracked tracks queued) for guild %s; refilled %s track(s) from the snapshot.",
+                                                BOT_ENV_PREFIX.lower(), len(_queued_keys), current_count, guild_id, refilled_count,
+                                            )
+
+                                    if added_rows or purged_live or purged_backup or trim_count or backup_content_trim or refilled_count:
                                         await snapshot_queue_backup(cur, guild_id)
 
                                     await cur.execute("DELETE FROM alucard_active_playlist_tracks WHERE guild_id = %s AND bot_name = 'alucard'", (guild_id,))
@@ -9380,22 +10146,22 @@ async def playlist_sync_loop():
                             continue
                         raise
 
-                if added_count or purged_live or purged_backup or trim_count or backup_content_trim:
+                if added_count or purged_live or purged_backup or trim_count or backup_content_trim or refilled_count:
                     guild = bot.get_guild(int(guild_id))
                     if guild:
                         vc = guild.voice_client
-                        if added_count > 0 and (not vc or (not _player_is_active(vc))):
+                        if (added_count > 0 or refilled_count > 0) and (not vc or (not _player_is_active(vc))):
                             target_channel = vc.channel if vc and getattr(vc, 'channel', None) else guild.get_channel(channel_id) if channel_id else await get_home_channel(guild)
                             if target_channel:
                                 schedule_named_task(f"playlist_sync_process_queue:{guild.id}", process_queue(guild, target_channel.id))
                         await send_feedback_notice(
                             guild,
                             "📡 Playlist Synced",
-                            f"Added **{added_count}** new, removed **{purged_live}** stale live row(s), cleaned **{purged_backup}** backup row(s), trimmed **{trim_count}** loop duplicate(s).",
+                            f"Added **{added_count}** new, removed **{purged_live}** stale live row(s), cleaned **{purged_backup}** backup row(s), trimmed **{trim_count}** loop duplicate(s), refilled **{refilled_count}** thin-queue row(s).",
                             discord.Color.green(),
-                            dedupe_key=f"playlist_sync:{added_count}:{purged_live}:{purged_backup}:{trim_count}",
+                            dedupe_key=f"playlist_sync:{added_count}:{purged_live}:{purged_backup}:{trim_count}:{refilled_count}",
                         )
-                        await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "📡 Playlist Sync", f"Guild {guild.name}: +{added_count} playlist track(s), -{purged_live} live row(s), -{purged_backup} backup row(s), -{trim_count} loop duplicates.", discord.Color.green())
+                        await send_webhook_log(bot.user.name if bot.user else "Unknown Node", "📡 Playlist Sync", f"Guild {guild.name}: +{added_count} playlist track(s), -{purged_live} live row(s), -{purged_backup} backup row(s), -{trim_count} loop duplicates, +{refilled_count} refilled.", discord.Color.green())
             except Exception as e:
                 logger.error("[%s] Playlist sync loop failed for guild %s: %s", BOT_ENV_PREFIX.lower(), guild_id, e, exc_info=True)
     except Exception as tx_error:
@@ -10298,7 +11064,11 @@ async def queue_integrity_check_loop():
                             continue  # perfect parity — nothing to repair
                         if player_active and backup_cnt > 0 and backup_cnt - live_cnt == 1:
                             continue  # one track dequeued for active playback — expected
-                        restored_live, _restored_backup = await repair_queue_backup_parity(cur, guild_id, active_player=player_active)
+                        # Actually hold the lock (not just check it) for the repair itself -- the
+                        # count checks above can yield to another coroutine between the earlier
+                        # .locked() peek and here, so that peek alone isn't race-proof (queue leak fix).
+                        async with get_process_queue_lock(guild_id):
+                            restored_live, _restored_backup = await repair_queue_backup_parity(cur, guild_id, active_player=player_active)
                         if restored_live <= 0:
                             continue
                         if player_active:
