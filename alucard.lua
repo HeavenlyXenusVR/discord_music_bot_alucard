@@ -2519,6 +2519,30 @@ end
 
 bot.gateway:on("READY", function()
   send_webhook_log("\xF0\x9F\x9F\xA2 Node Online", "ALUCARD is online and syncing with the swarm.", COLOR.green)
+  -- Rejoin and resume for any guild that was playing (or had a non-empty
+  -- queue) when this process last stopped -- container recreates/restarts
+  -- otherwise leave the bot sitting disconnected with a full queue and no
+  -- way back in short of a manual /play. This is a minimal port of what
+  -- alucard.py's on_ready recovery path did (full parity -- backoff,
+  -- exhausted-cooldown, Aria recovery-authority handoff -- is a much larger
+  -- follow-up, not attempted here).
+  copas.addthread(function()
+    copas.sleep(2) -- let the gateway session settle before opening voice
+    local rows = q("SELECT DISTINCT guild_id FROM alucard_bot_home_channels WHERE bot_name = 'alucard'") or {}
+    for _, row in ipairs(rows) do
+      local gid = row.guild_id
+      local channel_id = get_home_channel_id(gid)
+      if channel_id then
+        local has_queue = queue_count(gid) > 0
+        local was_playing = q1("SELECT is_playing FROM alucard_playback_state WHERE guild_id = %s AND bot_name = 'alucard'", gid)
+        if has_queue or (was_playing and was_playing.is_playing) then
+          log_info("[%s] resuming on boot (queue=%s, was_playing=%s)", gid, tostring(has_queue), tostring(was_playing and was_playing.is_playing))
+          ensure_voice_connection(gid, channel_id)
+          process_queue(gid, channel_id)
+        end
+      end
+    end
+  end)
 end)
 
 -- ===========================================================================
