@@ -480,11 +480,34 @@ end
 
 local ADMINISTRATOR = 0x8
 
+local guild_owner_cache = {} -- guild_id -> owner user_id
+
+local function get_guild_owner_id(guild_id)
+  if not guild_id then return nil end
+  local cached = guild_owner_cache[guild_id]
+  if cached then return cached end
+  local g = bot.rest:get("/guilds/" .. tostring(guild_id))
+  local owner_id = g and g.owner_id
+  if owner_id then guild_owner_cache[guild_id] = owner_id end
+  return owner_id
+end
+
 local function has_admin(interaction)
   local member = interaction.member
-  if not member or not member.permissions then return false end
-  local perms = tonumber(member.permissions) or 0
-  return perms % (ADMINISTRATOR * 2) >= ADMINISTRATOR
+  if member and member.permissions then
+    local perms = tonumber(member.permissions) or 0
+    if perms % (ADMINISTRATOR * 2) >= ADMINISTRATOR then return true end
+  end
+  -- The guild owner always effectively has admin, but Discord's resolved
+  -- member.permissions bitfield on the interaction has been observed to not
+  -- reliably reflect that (and/or loses precision through tonumber() for
+  -- very large permission values, same class of issue as pg.lua's
+  -- bigint-snowflake fix elsewhere in this codebase) -- so fall back to an
+  -- explicit ownership check rather than ever locking the actual owner out.
+  local uid = member and member.user and member.user.id
+  local gid = guild_id_of(interaction)
+  local owner_id = uid and get_guild_owner_id(gid)
+  return owner_id ~= nil and tostring(owner_id) == tostring(uid)
 end
 
 local function member_has_role(member, role_id)
