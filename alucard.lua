@@ -2603,7 +2603,16 @@ bot.gateway:on("READY", function()
   -- exhausted-cooldown, Aria recovery-authority handoff -- is a much larger
   -- follow-up, not attempted here).
   copas.addthread(function()
-    copas.sleep(2) -- let the gateway session settle before opening voice
+    -- Wait for the Lavalink websocket to actually be connected before
+    -- touching the queue -- process_queue deletes each row before resolving
+    -- it, so racing this against Lavalink's own (often slow, cold-start)
+    -- connect meant every "no response from Lavalink" failure permanently
+    -- destroyed that queued track instead of just skipping playback.
+    local waited = 0
+    while not (bot.lavalink and bot.lavalink.session_id) and waited < 60 do
+      copas.sleep(1)
+      waited = waited + 1
+    end
     local rows = q("SELECT DISTINCT guild_id FROM alucard_bot_home_channels WHERE bot_name = 'alucard'") or {}
     for _, row in ipairs(rows) do
       local gid = row.guild_id
