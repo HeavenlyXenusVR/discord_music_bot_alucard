@@ -125,11 +125,29 @@ local LOG_DIR = env(PREFIX .. "_LOG_DIR", env("MUSIC_BOT_LOG_DIR", "/app/logs"))
 pcall(function() os.execute("mkdir -p '" .. LOG_DIR .. "'") end)
 local LOG_FILE = LOG_DIR .. "/alucard.log"
 
+-- Matches alucard.py's RotatingFileHandler (10MB x 5 backups by default,
+-- same env var names) -- LOG_FILE previously grew unbounded forever.
+local LOG_MAX_BYTES = tonumber(env("MUSIC_BOT_LOG_MAX_BYTES", "10485760")) or 10485760
+local LOG_BACKUP_COUNT = tonumber(env("MUSIC_BOT_LOG_BACKUP_COUNT", "5")) or 5
+
+local function rotate_log_if_needed()
+  local f = io.open(LOG_FILE, "r")
+  if not f then return end
+  local size = f:seek("end")
+  f:close()
+  if not size or size < LOG_MAX_BYTES then return end
+  for i = LOG_BACKUP_COUNT - 1, 1, -1 do
+    os.rename(LOG_FILE .. "." .. i, LOG_FILE .. "." .. (i + 1))
+  end
+  os.rename(LOG_FILE, LOG_FILE .. ".1")
+end
+
 local function logline(level, fmt, ...)
   local ok, msg = pcall(string.format, fmt, ...)
   if not ok then msg = fmt end
   local line = string.format("%s %-5s alucard %s", os.date("%Y-%m-%d %H:%M:%S"), level, msg)
   print(line)
+  rotate_log_if_needed()
   local f = io.open(LOG_FILE, "a")
   if f then f:write(line .. "\n"); f:close() end
 end
@@ -2562,11 +2580,67 @@ local function heartbeat_tick()
   end
 end
 
+-- SwarmPanel/Aria remote-control bridge. Documented in the file-header
+-- simplifications list above as "intentionally not ported" -- that was wrong:
+-- without this, the panel's PAUSE/RESUME/SKIP/STOP/RESTART buttons write
+-- rows into alucard_swarm_overrides that nothing ever reads, so the bot
+-- silently ignores every panel command. This is the same
+-- poll-and-execute-then-delete pattern gws.lua/sapphire.lua already use
+-- (the "simpler sapphire_swarm_overrides poll loop" path Aria/SwarmPanel
+-- actually sends commands through -- the heavier claim-token
+-- swarm_direct_orders job queue is still not ported, matching those bots).
+local function poll_swarm_overrides()
+  local rows = q("SELECT guild_id, command FROM alucard_swarm_overrides WHERE bot_name = 'alucard'") or {}
+  for _, row in ipairs(rows) do
+    local guild_id = tostring(row.guild_id)
+    local cmd_name = (row.command or ""):upper()
+    local executed = false
+    if cmd_name == "RESTART" then
+      q("DELETE FROM alucard_swarm_overrides WHERE guild_id = %s AND bot_name = 'alucard'", guild_id)
+      send_webhook_log("\xF0\x9F\xA4\x96 Aria Override", "Aria requested a restart.", COLOR.purple)
+      os.exit(0)
+    elseif cmd_name == "PAUSE" and playback[guild_id] and not playback[guild_id].paused then
+      playback[guild_id].paused = true
+      playback[guild_id].offset = current_position(guild_id)
+      bot.lavalink:set_paused(guild_id, true)
+      q("UPDATE alucard_playback_state SET is_playing = FALSE, is_paused = TRUE WHERE guild_id = %s AND bot_name = 'alucard'", guild_id)
+      executed = true
+    elseif cmd_name == "RESUME" and playback[guild_id] and playback[guild_id].paused then
+      playback[guild_id].paused = false
+      playback[guild_id].start_time = socket.gettime()
+      bot.lavalink:set_paused(guild_id, false)
+      q("UPDATE alucard_playback_state SET is_playing = TRUE, is_paused = FALSE WHERE guild_id = %s AND bot_name = 'alucard'", guild_id)
+      executed = true
+    elseif cmd_name == "SKIP" and playback[guild_id] then
+      bot.lavalink:stop(guild_id)
+      executed = true
+    elseif cmd_name == "STOP" then
+      stop_playback(guild_id)
+      executed = true
+    end
+    if executed then
+      send_webhook_log("\xF0\x9F\xA4\x96 Aria Override", ("Aria executed **%s** in guild %s."):format(cmd_name, guild_id), COLOR.purple)
+    end
+    q("DELETE FROM alucard_swarm_overrides WHERE guild_id = %s AND bot_name = 'alucard' AND command = %s", guild_id, row.command)
+  end
+end
+
 local function start_background_loops()
   copas.addthread(function()
     while true do
       copas.sleep(10)
       persist_positions_tick()
+    end
+  end)
+
+  copas.addthread(function()
+    while true do
+      copas.sleep(10)
+      local ok, err = pcall(poll_swarm_overrides)
+      if not ok then
+        log_warn("swarm override poll error: %s", tostring(err))
+        report_error(nil, "runtime", "swarm override poll error", tostring(err))
+      end
     end
   end)
 
@@ -2593,8 +2667,25 @@ local function start_background_loops()
   end)
 end
 
+-- BUGFIX: the Discord gateway sends a fresh READY (not RESUMED) every time
+-- an in-flight session is invalidated -- routine network blips, not just
+-- container restarts -- and this handler used to run its full boot-resume
+-- pass every single time. Since resume unconditionally calls process_queue()
+-- for any guild that "was_playing", that meant every gateway hiccup popped
+-- and deleted the next queue row and force-restarted playback from 0, even
+-- while a track was already playing fine -- silently discarding whatever
+-- was queued behind it. This is the "constantly losing tracks" bug. Gating
+-- on did_initial_ready makes the resume pass run exactly once per process
+-- (i.e. on the boot/restart this logic was actually written for).
+local did_initial_ready = false
+
 bot.gateway:on("READY", function()
   send_webhook_log("\xF0\x9F\x9F\xA2 Node Online", "ALUCARD is online and syncing with the swarm.", COLOR.green)
+  if did_initial_ready then
+    log_info("gateway READY (reconnect) -- skipping boot-resume pass, already ran once this process")
+    return
+  end
+  did_initial_ready = true
   -- Rejoin and resume for any guild that was playing (or had a non-empty
   -- queue) when this process last stopped -- container recreates/restarts
   -- otherwise leave the bot sitting disconnected with a full queue and no
