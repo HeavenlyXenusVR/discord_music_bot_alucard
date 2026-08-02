@@ -1264,12 +1264,29 @@ local function clear_stage_topic(guild_id, channel_id)
   end)
 end
 
+-- guild_id..":"..track_uid -> consecutive resolve-failure count. A Lavalink/
+-- network blip mid-drain used to permanently delete every remaining queued
+-- track (each dequeued row was gone before load_tracks even ran, and a
+-- failed resolve just moved on to the next row with no requeue), so a short
+-- outage could wipe an entire queue in seconds. Now a failed resolve gets a
+-- few bounded retries via insert_queue_front before it's given up on.
+local resolve_attempts = {}
+local MAX_RESOLVE_ATTEMPTS = 3
+
 -- Pops the next track from alucard_queue and starts it. If the queue is empty,
 -- tries to restore from alucard_queue_backup (loop_mode == queue), else runs
 -- Auto-DJ, else disconnects (unless 24/7 mode is on).
 local function process_queue(guild_id, channel_id)
   if process_queue_busy[guild_id] then return end
   process_queue_busy[guild_id] = true
+  if not (bot.lavalink and bot.lavalink.session_id) then
+    -- Lavalink isn't connected right now -- leave the queue untouched rather
+    -- than dequeuing tracks we can't resolve; the watchdog thread and the
+    -- next natural trigger (TrackEnd, /play, RECOVER, ...) will retry once
+    -- it's back.
+    process_queue_busy[guild_id] = false
+    return
+  end
   local ok, err = pcall(function()
     local settings = get_settings(guild_id)
     local next_row = q1("SELECT id, video_url, title, requester_id, track_uid FROM alucard_queue WHERE guild_id = %s AND bot_name = 'alucard' ORDER BY id ASC LIMIT 1", guild_id)
@@ -1302,14 +1319,24 @@ local function process_queue(guild_id, channel_id)
     local url, title, requester_id = next_row.video_url, next_row.title, next_row.requester_id
     q("DELETE FROM alucard_queue WHERE id = %s AND guild_id = %s AND bot_name = 'alucard'", next_row.id, guild_id)
 
+    local retry_key = guild_id .. ":" .. tostring(track_uid or url)
     local result, lerr = bot.lavalink:load_tracks(url)
     local entries, _pn, uerr = unwrap_load_result(result)
     if uerr or #entries == 0 then
-      log_warn("[%s] track resolve failed for '%s': %s", guild_id, tostring(title), tostring(uerr or lerr))
-      -- Give up on this one track and move to the next rather than getting stuck.
+      local attempts = (resolve_attempts[retry_key] or 0) + 1
+      if attempts < MAX_RESOLVE_ATTEMPTS then
+        resolve_attempts[retry_key] = attempts
+        log_warn("[%s] resolve failed for '%s' (attempt %d/%d): %s -- requeuing", guild_id, tostring(title), attempts, MAX_RESOLVE_ATTEMPTS, tostring(uerr or lerr))
+        insert_queue_front(guild_id, url, title, requester_id, track_uid)
+        return
+      end
+      resolve_attempts[retry_key] = nil
+      log_warn("[%s] giving up on '%s' after %d failed resolves: %s", guild_id, tostring(title), attempts, tostring(uerr or lerr))
+      report_error(guild_id, "runtime", "track resolve failed permanently", ("%s: %s"):format(tostring(title), tostring(uerr or lerr)))
       copas.addthread(function() process_queue(guild_id, channel_id) end)
       return
     end
+    resolve_attempts[retry_key] = nil
     local track = entries[1]
 
     ensure_voice_connection(guild_id, channel_id)
@@ -2923,6 +2950,38 @@ local function poll_direct_orders()
   end
 end
 
+local recovery_in_flight = {} -- guild_id -> true while a watchdog recovery attempt is running
+
+-- Runs periodically (see start_background_loops), not just at boot, so a
+-- guild whose queue-drain stalled out mid-session -- e.g. it gave up after
+-- MAX_RESOLVE_ATTEMPTS resolve failures during a Lavalink/network outage --
+-- gets resumed automatically instead of staying dead until someone notices
+-- and manually restarts or reissues a command. Unlike gws, this bot has no
+-- in-memory voice-channel tracking table, so the "gateway thinks we're not
+-- connected" half of gws's watchdog isn't ported here; this covers the
+-- "connected/idle but queue non-empty" stall using the guild's home channel
+-- as the reconnect target, same fallback bootstrap_recovery already uses.
+local function recovery_watchdog()
+  local stalled = q([[SELECT DISTINCT q.guild_id FROM alucard_queue q WHERE q.bot_name = 'alucard']]) or {}
+  for _, row in ipairs(stalled) do
+    local guild_id = tostring(row.guild_id)
+    if not playback[guild_id] and not recovery_in_flight[guild_id] then
+      local channel_id = get_home_channel_id(guild_id)
+      if channel_id then
+        recovery_in_flight[guild_id] = true
+        copas.addthread(function()
+          local ok, err = pcall(process_queue, guild_id, channel_id)
+          if not ok then
+            log_warn("recovery_watchdog error for guild %s: %s", guild_id, tostring(err))
+            report_error(guild_id, "runtime", "recovery_watchdog error", tostring(err))
+          end
+          recovery_in_flight[guild_id] = nil
+        end)
+      end
+    end
+  end
+end
+
 local function start_background_loops()
   copas.addthread(function()
     while true do
@@ -2949,6 +3008,17 @@ local function start_background_loops()
       if not ok then
         log_warn("direct order poll error: %s", tostring(err))
         report_error(nil, "runtime", "direct order poll error", tostring(err))
+      end
+    end
+  end)
+
+  copas.addthread(function()
+    while true do
+      copas.sleep(30)
+      local ok, err = pcall(recovery_watchdog)
+      if not ok then
+        log_warn("recovery_watchdog error: %s", tostring(err))
+        report_error(nil, "runtime", "recovery_watchdog error", tostring(err))
       end
     end
   end)
